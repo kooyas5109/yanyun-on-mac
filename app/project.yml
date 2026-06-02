@@ -1,0 +1,58 @@
+name: Simulator
+options:
+  deploymentTarget:
+    macOS: "14.0"
+settings:
+  base:
+    DEBUG_INFORMATION_FORMAT: "dwarf"
+    ONLY_ACTIVE_ARCH: "YES"
+    SWIFT_VERSION: "5.0"
+    ARCHS: "arm64"
+targets:
+  Simulator:
+    type: application
+    platform: macOS
+    sources:
+      - Simulator
+    settings:
+      base:
+        INFOPLIST_FILE: Simulator/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Simulator/Simulator.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: yanyun.simulator
+        PRODUCT_NAME: "Simulator"
+        DEBUG_INFORMATION_FORMAT: "dwarf"
+        GENERATE_DEBUG_SYMBOLS: "NO"
+    preBuildScripts:
+      - name: "Build winecompat"
+        script: |
+          REPO_ROOT="${SRCROOT}/.."
+          SRC="$REPO_ROOT/wine/winecompat/winecompat.c"
+          OUT_DIR="$REPO_ROOT/output/wine-release/lib/wine/x86_64-unix"
+          OUT="$OUT_DIR/cxcompatdb.so"
+          if [ -f "$SRC" ]; then
+            mkdir -p "$OUT_DIR"
+            arch -x86_64 clang -arch x86_64 -shared -o "$OUT" -O2 -fvisibility=hidden -finline-functions -fstack-protector-all -ffile-prefix-map="$REPO_ROOT/wine/winecompat"=. -mmacosx-version-min=10.15 -install_name "win64/cxcompatdb.so" -Wl,-no_compact_unwind "$SRC"
+            strip -x "$OUT"
+            codesign --force -s - "$OUT"
+          fi
+        basedOnDependencyAnalysis: false
+      - name: "Copy Wine Runtime"
+        script: |
+          WINE_SRC="${SRCROOT}/../output/wine-release"
+          WINE_DST="${BUILT_PRODUCTS_DIR}/${WRAPPER_NAME}/Contents/Resources/wine-release"
+          if [ -d "$WINE_SRC" ]; then
+            mkdir -p "$WINE_DST"
+            rsync -a --delete "$WINE_SRC/" "$WINE_DST/"
+          fi
+        basedOnDependencyAnalysis: false
+    postBuildScripts:
+      - name: "Sign Wine Binaries"
+        script: |
+          WINE_DIR="${BUILT_PRODUCTS_DIR}/${WRAPPER_NAME}/Contents/Resources/wine-release"
+          if [ ! -d "$WINE_DIR" ]; then exit 0; fi
+          SIGN_ID="Developer ID Application"
+          security find-identity -v -p basic 2>/dev/null | grep -q "$SIGN_ID" || SIGN_ID="-"
+          find "$WINE_DIR" \( -name "*.dylib" -o -name "*.so" -o -type f -perm +111 \) | while read f; do
+            file "$f" | grep -q "Mach-O" && codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$f" 2>/dev/null || true
+          done
+        basedOnDependencyAnalysis: false

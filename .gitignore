@@ -1,0 +1,35 @@
+# 输出目录（Wine 运行时 ~2GB，不入仓库）
+# 通过单独渠道分发，或本地构建
+output/
+
+# Xcode
+*.xcworkspace
+xcuserdata/
+DerivedData/
+# XcodeGen 生成的项目文件（可通过 cd app && xcodegen generate 重建）
+app/Simulator.xcodeproj/
+
+# 编译产物
+app/build/
+*.so
+*.dylib
+*.dll
+*.o
+*.dSYM
+
+# 测试/调试文件
+app/build_test.swift
+
+# 打包文件
+*.tar.gz
+*.zip
+*.dmg
+*.app
+
+# 日志
+*.log
+
+# macOS
+.DS_Store
+*.swp
+*~
