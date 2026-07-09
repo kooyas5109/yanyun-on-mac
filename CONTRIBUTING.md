@@ -9,7 +9,7 @@
 ## 提代码的流程
 
 1. Fork → 新建分支（`feat/xxx` 或 `fix/xxx`）
-2. 改完确认本地能跑：`bash scripts/dev-deploy.sh`
+2. 改完确认本地能跑：`OUTPUT_DIR=~/Desktop bash scripts/dev-deploy.sh`（`OUTPUT_DIR` 指定 .app 输出到哪，不设会报错）
 3. Commit 用英文，遵循 [Conventional Commits](https://www.conventionalcommits.org/)：
    ```
    feat: add controller support
@@ -26,7 +26,7 @@
 
 ## PR 自检
 
-- [ ] `scripts/dev-deploy.sh` 能跑通
+- [ ] `OUTPUT_DIR=~/Desktop bash scripts/dev-deploy.sh` 能跑通
 - [ ] 没有提交密钥、证书或个人信息
 - [ ] PR 标题符合 Conventional Commits
 

@@ -4,13 +4,84 @@ let app = NSApplication.shared
 app.setActivationPolicy(.regular)
 
 // ============================================================
+// 游戏配置（运行时从 bundle 内 config.plist / faq.txt 读取）
+// 每个游戏对应 app/targets/<game>/ 一份配置，打包时拷进 Resources。
+// ============================================================
+/// 单个游戏的全部差异项，逻辑代码不含硬编码，值全部来自此结构。
+struct GameConfig: Decodable {
+    let appIdentifier: String    // App Support 目录名 + 进程匹配
+    let feverDownloadURL: String // 发烧平台安装器下载地址
+    let gameId: Int              // 发烧平台数字游戏 ID
+    let gameKey: String          // 透传标识："yysls" / "ywzh"
+    let title: String            // 主界面游戏标题
+    let windowTitle: String      // 窗口标题
+    let aboutTitle: String       // 关于菜单标题
+    let volumeSkipName: String   // 扫描外接设备时跳过的自身 DMG 卷名
+    let qqGroup: String          // QQ 群号
+    let productName: String      // 产物名（打包脚本用，App 内不消费）
+}
+
+/// 配置加载失败：明确弹窗报错并退出，不静默使用默认值。
+func fatalConfigError(_ msg: String) -> Never {
+    let alert = NSAlert()
+    alert.messageText = "配置加载失败"
+    alert.informativeText = msg
+    alert.alertStyle = .critical
+    alert.addButton(withTitle: "退出")
+    alert.runModal()
+    exit(1)
+}
+
+/// 定位 target 资源：优先 App bundle Resources；开发态回落到源码 app/targets/<target>/。
+/// 开发态目标由环境变量 SIM_DEV_TARGET 指定，缺省 yanyun。
+/// 打包后一律走 bundle 分支；fallback 仅用于裸跑二进制调试，按常见 CWD 逐一探测。
+func targetResourceURL(_ name: String, _ ext: String) -> URL? {
+    if let u = Bundle.main.url(forResource: name, withExtension: ext) { return u }
+    let target = ProcessInfo.processInfo.environment["SIM_DEV_TARGET"] ?? "yanyun"
+    let rel = "targets/\(target)/\(name).\(ext)"
+    let cwd = FileManager.default.currentDirectoryPath
+    var candidates = [
+        "\(cwd)/app/\(rel)",   // 从仓库根运行
+        "\(cwd)/\(rel)",       // 从 app/ 目录运行
+    ]
+    // 相对可执行文件所在目录再兜底探测（../../app/targets 等）
+    let execDir = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+    candidates.append(execDir.deletingLastPathComponent().appendingPathComponent("app/\(rel)").path)
+    for p in candidates where FileManager.default.fileExists(atPath: p) {
+        return URL(fileURLWithPath: p)
+    }
+    return nil
+}
+
+let cfg: GameConfig = {
+    guard let url = targetResourceURL("config", "plist") else {
+        fatalConfigError("找不到 config.plist，App 资源可能损坏。")
+    }
+    do {
+        let data = try Data(contentsOf: url)
+        return try PropertyListDecoder().decode(GameConfig.self, from: data)
+    } catch {
+        fatalConfigError("解析 config.plist 失败：\(error)")
+    }
+}()
+
+/// FAQ 全文（bundle 内 faq.txt）
+let faqText: String = {
+    if let url = targetResourceURL("faq", "txt"),
+       let s = try? String(contentsOf: url, encoding: .utf8) {
+        return s
+    }
+    return "暂无内容。"
+}()
+
+// ============================================================
 // 标准菜单栏（支持 ⌘Q 退出、⌘H 隐藏、⌘M 最小化）
 // ============================================================
 let mainMenu = NSMenu()
 let appMenuItem = NSMenuItem()
 mainMenu.addItem(appMenuItem)
 let appMenu = NSMenu()
-appMenu.addItem(withTitle: "关于燕云模拟器", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+appMenu.addItem(withTitle: cfg.aboutTitle, action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
 appMenu.addItem(NSMenuItem.separator())
 appMenu.addItem(withTitle: "隐藏", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
 let hideOthers = appMenu.addItem(withTitle: "隐藏其他", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
@@ -32,14 +103,18 @@ app.mainMenu = mainMenu
 // ============================================================
 // 全局配置
 // ============================================================
-let appIdentifier = "yanyun.simulator"  // App Support 目录名，也用于进程匹配
-let feverDownloadURL = "https://loadingbaycn.webapp.163.com/app/v1/download_client/windows/mkt-h72-neice:netease.uubooster03pc_cps_dev/url"
-
+let appIdentifier = cfg.appIdentifier  // App Support 目录名，也用于进程匹配
+let feverDownloadURL = cfg.feverDownloadURL
 
 /// 是否启用 Wine 详细日志调试模式
 /// true  → WINEDEBUG 输出详细日志到 Logs/wine_debug.log
 /// false → WINEDEBUG=-all（抑制所有输出，正式发布用）
 let debugWineLog = false
+
+/// DXMT 崩溃复现调试开关（仅排障用，正式发布必须为 false）
+/// true  → 强制该游戏走 DXMT(backend=2) + 打开详细 Wine/DXMT 日志，用于对照复现
+/// false → 按 winecompat 正常决定后端（ywzh 走 dxmt，纯虚崩溃已由 cxcompatdb 热修复）
+let debugDxmt = false
 
 /// 生成固定 18×18 画布的 SF Symbol 模板图标
 /// 使用 drawingHandler 方式，Retina 下自动按屏幕分辨率渲染（不模糊），且所有图标等宽对齐
@@ -69,6 +144,9 @@ let fm = FileManager.default
 let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
     .appendingPathComponent(appIdentifier)
 let winePrefix = appSupport.appendingPathComponent("wine-prefix")
+// GPTK（Metal 原生 D3D 渲染组件）公共存放位置，与 wine-prefix 同级。
+// 用户自行放置，不随 App 分发；存在时 ywzh 等 D3D12 游戏优先走 Metal 直译路径。
+let gptkDir = appSupport.appendingPathComponent("gptk")
 let logsDir = appSupport.appendingPathComponent("Logs")
 let installerPath = appSupport.appendingPathComponent("fever-installer.exe")
 let feverGamesDir = winePrefix.appendingPathComponent("drive_c/Program Files/FeverGames")
@@ -85,6 +163,12 @@ func ensureDirs() {
     }
 }
 ensureDirs()
+
+// debug 模式：每次 App 启动清空 Wine 日志，避免多次运行内容叠加
+// （旧写法用 forWritingAtPath 不 truncate，短内容覆盖后留旧尾巴，日志混叠不可信）
+if debugWineLog {
+    try? Data().write(to: logsDir.appendingPathComponent("wine_debug.log"))
+}
 
 // ============================================================
 // 日志
@@ -152,12 +236,16 @@ var state: State = .idle {
                 hideLoading()
                 errorView?.removeFromSuperview()
                 errorView = nil
+                setGameIconsEnabled(true)
             case .loading:
                 errorView?.removeFromSuperview()
                 errorView = nil
+                hideGameHints()          // 双击启动后提示文案一次性消失
+                setGameIconsEnabled(false)
             case .failed(let msg):
                 hideLoading()
                 showErrorUI(msg)
+                setGameIconsEnabled(true) // 图标恢复可点，但提示文案不重现
             }
         }
     }
@@ -177,6 +265,23 @@ func isFeverRunning() -> Bool {
 }
 
 // ============================================================
+// 游戏模型（数据驱动多图标）
+// ============================================================
+/// 主界面展示的游戏。每个 App 只对应一个游戏（配置来自 config.plist），
+/// 通过 URL scheme（fevergames://mygame/?gameId=<id>）进入对应游戏。
+struct Game {
+    let id: String            // 透传标识："yysls" / "ywzh"
+    let title: String         // 标题文案
+    let iconResource: String  // App Resources 中的图标文件名（不含后缀）
+    let gameId: Int           // 发烧平台数字游戏 ID
+    /// 传给 launcher 的启动 URL
+    var launchURL: String { "fevergames://mygame/?gameId=\(gameId)" }
+}
+let games = [
+    Game(id: cfg.gameKey, title: cfg.title, iconResource: "game-icon", gameId: cfg.gameId),
+]
+
+// ============================================================
 // 窗口
 // ============================================================
 let window = NSWindow(
@@ -185,7 +290,7 @@ let window = NSWindow(
     backing: .buffered,
     defer: false
 )
-window.title = "燕云模拟器"
+window.title = cfg.windowTitle
 window.center()
 window.backgroundColor = NSColor.windowBackgroundColor
 let cv = window.contentView!
@@ -194,39 +299,80 @@ cv.wantsLayer = true
 // ============================================================
 // 左侧：游戏图标 + 双击（左上角位置）
 // ============================================================
-let iconView = NSImageView(frame: NSRect(x: 42, y: 450 - 26 - 92, width: 92, height: 92))
-iconView.imageScaling = .scaleProportionallyUpOrDown
-iconView.wantsLayer = true
-iconView.layer?.cornerRadius = 12
-iconView.layer?.masksToBounds = true
-// 从 App Bundle Resources 加载游戏图标
-if let logoPath = Bundle.main.path(forResource: "logo", ofType: "png"),
-   let logoImage = NSImage(contentsOfFile: logoPath) {
-    iconView.image = logoImage
-} else {
-    // fallback: 尝试从源码目录加载（开发调试用）
-    let devPath = URL(fileURLWithPath: #file).deletingLastPathComponent().appendingPathComponent("logo.png").path
-    if let img = NSImage(contentsOfFile: devPath) {
-        iconView.image = img
+// 数据驱动生成游戏图标：图标 + 标题 + 提示文案 + 双击手势
+var gameIconViews: [NSImageView] = []
+var gameDescLabels: [NSTextField] = []
+var gameGestures: [NSClickGestureRecognizer] = []
+var gameClickers: [ClickHandler] = []   // 持有 handler，避免被释放
+
+let iconSize: CGFloat = 92
+let iconGap: CGFloat = 40
+let firstIconX: CGFloat = 42
+let iconY: CGFloat = 450 - 26 - iconSize
+
+for (index, game) in games.enumerated() {
+    let iconX = firstIconX + CGFloat(index) * (iconSize + iconGap)
+    let iconCenterX = iconX + iconSize / 2
+
+    // 图标
+    let iconView = NSImageView(frame: NSRect(x: iconX, y: iconY, width: iconSize, height: iconSize))
+    iconView.imageScaling = .scaleProportionallyUpOrDown
+    iconView.wantsLayer = true
+    iconView.layer?.cornerRadius = 12
+    iconView.layer?.masksToBounds = true
+    // 从 App Bundle Resources 加载游戏图标
+    if let logoPath = Bundle.main.path(forResource: game.iconResource, ofType: "png"),
+       let logoImage = NSImage(contentsOfFile: logoPath) {
+        iconView.image = logoImage
     } else {
-        iconView.image = NSImage(systemSymbolName: "gamecontroller.fill", accessibilityDescription: nil)
+        // fallback: 从源码 targets 目录加载（开发调试用）
+        if let devURL = targetResourceURL(game.iconResource, "png"),
+           let img = NSImage(contentsOfFile: devURL.path) {
+            iconView.image = img
+        } else {
+            iconView.image = NSImage(systemSymbolName: "gamecontroller.fill", accessibilityDescription: nil)
+        }
     }
+    cv.addSubview(iconView)
+
+    // 标题
+    let titleLabel = NSTextField(labelWithString: game.title)
+    titleLabel.frame = NSRect(x: iconX, y: iconY - 30, width: iconSize, height: 22)
+    titleLabel.font = NSFont.systemFont(ofSize: 15, weight: .bold)
+    titleLabel.textColor = .labelColor
+    titleLabel.alignment = .center
+    cv.addSubview(titleLabel)
+
+    // 提示文案（每个图标下方各一行，双击后一次性消失）
+    let descLabel = NSTextField(labelWithString: "双击游戏图标启动游戏")
+    descLabel.frame = NSRect(x: iconCenterX - 65, y: iconY - 52, width: 130, height: 16)
+    descLabel.font = NSFont.systemFont(ofSize: 11)
+    descLabel.textColor = .secondaryLabelColor
+    descLabel.alignment = .center
+    cv.addSubview(descLabel)
+
+    // 双击手势（各自绑定，handler 持有对应 Game）
+    let clicker = ClickHandler(game: game, iconView: iconView)
+    let gesture = NSClickGestureRecognizer(target: clicker, action: #selector(ClickHandler.doubleClick))
+    gesture.numberOfClicksRequired = 2
+    iconView.addGestureRecognizer(gesture)
+
+    gameIconViews.append(iconView)
+    gameDescLabels.append(descLabel)
+    gameGestures.append(gesture)
+    gameClickers.append(clicker)
 }
-cv.addSubview(iconView)
 
-let titleLabel = NSTextField(labelWithString: "燕云十六声")
-titleLabel.frame = NSRect(x: 42, y: 450 - 26 - 92 - 30, width: 92, height: 22)
-titleLabel.font = NSFont.systemFont(ofSize: 15, weight: .bold)
-titleLabel.textColor = .labelColor
-titleLabel.alignment = .center
-cv.addSubview(titleLabel)
+/// 隐藏所有游戏提示文案（双击启动后一次性消失，不再重现）
+func hideGameHints() {
+    for label in gameDescLabels { label.isHidden = true }
+}
 
-let descLabel = NSTextField(labelWithString: "双击游戏图标启动游戏")
-descLabel.frame = NSRect(x: 0, y: 450 - 26 - 92 - 55, width: 176, height: 16)
-descLabel.font = NSFont.systemFont(ofSize: 12)
-descLabel.textColor = .secondaryLabelColor
-descLabel.alignment = .center
-cv.addSubview(descLabel)
+/// loading 期间禁用/恢复游戏图标（视觉降透明度 + 手势响应开关）
+func setGameIconsEnabled(_ enabled: Bool) {
+    for view in gameIconViews { view.alphaValue = enabled ? 1.0 : 0.4 }
+    for gesture in gameGestures { gesture.isEnabled = enabled }
+}
 
 // ============================================================
 // 双击手势 + 残影爆开动画
@@ -293,28 +439,30 @@ func playGhostExpandAnimation(on view: NSImageView) {
 }
 
 class ClickHandler: NSObject {
+    let game: Game
+    let iconView: NSImageView
+    init(game: Game, iconView: NSImageView) {
+        self.game = game
+        self.iconView = iconView
+    }
     @objc func doubleClick(_ sender: NSClickGestureRecognizer) {
         switch state {
         case .idle, .failed:
-            // 播放残影爆开动画
+            // 播放残影爆开动画（作用在被点击的图标上）
             playGhostExpandAnimation(on: iconView)
-            
+
             // 如果游戏平台已经在运行，直接拉起窗口（不新开 wine 进程）
             if isFeverRunning() {
-                log("游戏平台已在运行，尝试拉起窗口")
-                bringFeverToFront()
+                log("游戏平台已在运行，尝试拉起窗口: \(game.id)")
+                bringFeverToFront(game)
             } else {
-                startLaunch()
+                startLaunch(game)
             }
         case .loading:
             break  // loading 中忽略
         }
     }
 }
-let clicker = ClickHandler()
-let gesture = NSClickGestureRecognizer(target: clicker, action: #selector(ClickHandler.doubleClick))
-gesture.numberOfClicksRequired = 2
-iconView.addGestureRecognizer(gesture)
 
 // ============================================================
 // 右侧：设置面板
@@ -340,25 +488,7 @@ class FAQHandler: NSObject {
     @objc func handleFAQ() {
         let alert = NSAlert()
         alert.messageText = "常见问题"
-        alert.informativeText = """
-Q：Mac电脑运行燕云模拟器+燕云游戏的推荐配置是？
-A：建议 macOS 15 (Sequoia) 或更高版本，内存 16GB 以上，芯片 M2 及以上。M1 可以跑但性能一般。不支持 Intel Mac。
-
-Q：右键点击图标退出没有反应怎么办？
-A：按住 option 键再右键退出，或者打开模拟器窗口选择强制退出游戏。
-
-Q：为什么在启动器上点击安装游戏/踏入江湖后要等一会儿才开始加载？
-A：Wine 翻译指令需要时间，安装或更新后尤其明显。如果主按钮无响应，退出游戏平台后重新打开再试。
-
-Q：我在下载或更新游戏时，卡在某个步骤很久，怎么办？
-A：退出游戏平台重新启动试试。如果反复出现，把 ~/Library/Application Support/yanyun.simulator/ 整个文件夹删了重来。
-
-Q：如何彻底删除模拟器？
-A：打开模拟器点"重置模拟器环境"，然后把 App 丢废纸篓。再删掉 ~/Library/Application Support/yanyun.simulator/ 文件夹就彻底干净了。如果游戏装在其他路径（比如移动硬盘），那边也要手动删。
-
-Q：如果有更多问题，怎么向别人求助？
-A：可以加模拟器上显示的 QQ 群聊。
-"""
+        alert.informativeText = faqText
         alert.alertStyle = .informational
         alert.addButton(withTitle: "好的")
         alert.runModal()
@@ -461,7 +591,7 @@ settingsPanel.addSubview(resetBtn)
 
 // 加入交流群
 class QQGroupHandler: NSObject {
-    let qqGroupNumber: String = "1080300274"
+    let qqGroupNumber: String = cfg.qqGroup
 
     @objc func handleQQGroup() {
         NSPasteboard.general.clearContents()
@@ -698,13 +828,15 @@ func launchWineBackground(exe: String, args: [String], env: [String: String], wo
     p.executableURL = scriptPath
     p.standardOutput = FileHandle.nullDevice
     if debugWineLog {
-        // debug 模式：Wine stderr 重定向到 wine_debug.log
+        // debug 模式：Wine stderr 追加写入 wine_debug.log
+        // 用 O_APPEND 保证多个后台进程（wineserver -p 与游戏进程并发）写入时
+        // 由内核原子追加到文件末尾，不会互相覆盖；文件在 App 启动时已清空一次。
         let wineDebugLogPath = logsDir.appendingPathComponent("wine_debug.log").path
-        if let fh = FileHandle(forWritingAtPath: wineDebugLogPath) {
-            p.standardError = fh
+        let fd = open(wineDebugLogPath, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        if fd >= 0 {
+            p.standardError = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
         } else {
-            fm.createFile(atPath: wineDebugLogPath, contents: nil)
-            p.standardError = FileHandle(forWritingAtPath: wineDebugLogPath) ?? FileHandle.nullDevice
+            p.standardError = FileHandle.nullDevice
         }
     } else {
         p.standardError = FileHandle.nullDevice
@@ -755,6 +887,178 @@ func checkPrefix() -> Bool {
     return false
 }
 
+// ============================================================
+// 字体族名重写(修复 web view 公告标题中文变方块)
+// web view 走 DirectWrite,按字体 name 表里的“真实族名”查找;prefix 里
+// 没有名为 "Microsoft YaHei"/"SimSun" 的字体,标题请求这些名字时找不到字形
+// 就退回拉丁字体 → 中文豆腐块(Wine 私有的 Fonts\Replacements 与 GDI 的
+// FontSubstitutes 都不被 DirectWrite 的 FindFamilyName 采用)。
+// 解决:以本机 Arial Unicode 为字模,重写其 name 表为这些常用中文字体族名,
+// 产出“名字对得上”的真字体。仅在用户本机用其自有字体重打标签,不随 App 分发。
+// ============================================================
+
+private struct SFNTNameRecord {
+    let platformID: UInt16
+    let encodingID: UInt16
+    let languageID: UInt16
+    let nameID: UInt16
+    let bytes: Data
+}
+
+private func sfntAppendBE16(_ d: inout Data, _ v: UInt16) {
+    d.append(UInt8(v >> 8)); d.append(UInt8(v & 0xff))
+}
+private func sfntAppendBE32(_ d: inout Data, _ v: UInt32) {
+    d.append(UInt8((v >> 24) & 0xff)); d.append(UInt8((v >> 16) & 0xff))
+    d.append(UInt8((v >> 8) & 0xff)); d.append(UInt8(v & 0xff))
+}
+private func sfntUTF16BE(_ s: String) -> Data {
+    var d = Data()
+    for u in s.utf16 { sfntAppendBE16(&d, u) }
+    return d
+}
+
+// 计算 sfnt 表校验和:按大端 uint32 累加(不足 4 字节按 0 补齐)
+private func sfntChecksum(_ bytes: [UInt8]) -> UInt32 {
+    var sum: UInt32 = 0
+    var i = 0
+    let n = bytes.count
+    while i < n {
+        let b0 = UInt32(bytes[i])
+        let b1 = i + 1 < n ? UInt32(bytes[i + 1]) : 0
+        let b2 = i + 2 < n ? UInt32(bytes[i + 2]) : 0
+        let b3 = i + 3 < n ? UInt32(bytes[i + 3]) : 0
+        sum = sum &+ ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+        i += 4
+    }
+    return sum
+}
+
+// 生成 name 表(format 0),记录须按 (platform,encoding,language,nameID) 升序
+private func sfntBuildNameTable(_ records: [SFNTNameRecord]) -> Data {
+    let sorted = records.sorted {
+        if $0.platformID != $1.platformID { return $0.platformID < $1.platformID }
+        if $0.encodingID != $1.encodingID { return $0.encodingID < $1.encodingID }
+        if $0.languageID != $1.languageID { return $0.languageID < $1.languageID }
+        return $0.nameID < $1.nameID
+    }
+    var storage = Data()
+    var recBlob = Data()
+    for r in sorted {
+        let off = storage.count
+        storage.append(r.bytes)
+        sfntAppendBE16(&recBlob, r.platformID)
+        sfntAppendBE16(&recBlob, r.encodingID)
+        sfntAppendBE16(&recBlob, r.languageID)
+        sfntAppendBE16(&recBlob, r.nameID)
+        sfntAppendBE16(&recBlob, UInt16(r.bytes.count))
+        sfntAppendBE16(&recBlob, UInt16(off))
+    }
+    var out = Data()
+    sfntAppendBE16(&out, 0)                                  // format
+    sfntAppendBE16(&out, UInt16(sorted.count))              // count
+    sfntAppendBE16(&out, UInt16(6 + sorted.count * 12))     // stringOffset
+    out.append(recBlob)
+    out.append(storage)
+    return out
+}
+
+// 构造某个字体族名对应的全部 name 记录:Windows 平台同时写英文(0x409)与
+// 简体中文(0x804)两条族名,页面无论用英文名还是中文名都能命中;另补 Mac 平台。
+private func sfntMakeNameRecords(familyEn: String, familyZh: String, ps: String) -> [SFNTNameRecord] {
+    var recs: [SFNTNameRecord] = []
+    func win(_ nameID: UInt16, _ s: String, _ lang: UInt16) {
+        recs.append(SFNTNameRecord(platformID: 3, encodingID: 1, languageID: lang, nameID: nameID, bytes: sfntUTF16BE(s)))
+    }
+    let en: UInt16 = 0x0409
+    let zh: UInt16 = 0x0804
+    win(1, familyEn, en); win(2, "Regular", en); win(3, ps, en)
+    win(4, familyEn, en); win(6, ps, en); win(16, familyEn, en); win(17, "Regular", en)
+    win(1, familyZh, zh); win(4, familyZh, zh); win(16, familyZh, zh)
+    func mac(_ nameID: UInt16, _ s: String) {
+        recs.append(SFNTNameRecord(platformID: 1, encodingID: 0, languageID: 0, nameID: nameID, bytes: Data(s.utf8)))
+    }
+    mac(1, familyEn); mac(2, "Regular"); mac(4, familyEn); mac(6, ps)
+    return recs
+}
+
+// 重建 sfnt 字体:替换 name 表、丢弃 DSIG(改后失效)、重算表目录与校验和
+private func sfntRebuild(source: Data, newNameTable: Data) -> Data? {
+    let src = [UInt8](source)
+    guard src.count >= 12 else { return nil }
+    func be16(_ o: Int) -> Int { Int(src[o]) << 8 | Int(src[o + 1]) }
+    func be32(_ o: Int) -> UInt32 {
+        UInt32(src[o]) << 24 | UInt32(src[o + 1]) << 16 | UInt32(src[o + 2]) << 8 | UInt32(src[o + 3])
+    }
+    let sfntVersion = be32(0)
+    let numTables = be16(4)
+    var tables: [(tag: String, data: Data)] = []
+    for i in 0..<numTables {
+        let ro = 12 + i * 16
+        guard ro + 16 <= src.count else { return nil }
+        let tag = String(bytes: src[ro..<ro + 4], encoding: .ascii) ?? ""
+        let off = Int(be32(ro + 8))
+        let len = Int(be32(ro + 12))
+        guard off + len <= src.count else { return nil }
+        tables.append((tag, Data(src[off..<off + len])))
+    }
+    var out: [(tag: String, data: Data)] = []
+    var replaced = false
+    for t in tables {
+        if t.tag == "DSIG" { continue }
+        if t.tag == "name" { out.append(("name", newNameTable)); replaced = true; continue }
+        out.append(t)
+    }
+    if !replaced { out.append(("name", newNameTable)) }
+    // head 表的 checkSumAdjustment 先置 0(offset 8),稍后按整文件校验和回填
+    for i in out.indices where out[i].tag == "head" {
+        var h = [UInt8](out[i].data)
+        if h.count >= 12 { h[8] = 0; h[9] = 0; h[10] = 0; h[11] = 0 }
+        out[i].data = Data(h)
+    }
+    out.sort { $0.tag < $1.tag }
+    let n = out.count
+    var offset = 12 + n * 16
+    var recs: [(tag: String, checksum: UInt32, offset: Int, length: Int)] = []
+    var body = Data()
+    for t in out {
+        let cs = sfntChecksum([UInt8](t.data))
+        recs.append((t.tag, cs, offset, t.data.count))
+        body.append(t.data)
+        let pad = (4 - (t.data.count % 4)) % 4
+        if pad > 0 { body.append(Data(repeating: 0, count: pad)) }
+        offset += t.data.count + pad
+    }
+    var header = Data()
+    sfntAppendBE32(&header, sfntVersion)
+    sfntAppendBE16(&header, UInt16(n))
+    var esInt = 0
+    while (1 << (esInt + 1)) <= n { esInt += 1 }
+    let sr = UInt16(1 << esInt) &* 16
+    let rs = UInt16(n * 16) &- sr
+    sfntAppendBE16(&header, sr)
+    sfntAppendBE16(&header, UInt16(esInt))
+    sfntAppendBE16(&header, rs)
+    for r in recs {
+        var tagBytes = Array(r.tag.utf8)
+        while tagBytes.count < 4 { tagBytes.append(0x20) }
+        header.append(contentsOf: tagBytes.prefix(4))
+        sfntAppendBE32(&header, r.checksum)
+        sfntAppendBE32(&header, UInt32(r.offset))
+        sfntAppendBE32(&header, UInt32(r.length))
+    }
+    var file = [UInt8](header + body)
+    let adjustment = 0xB1B0AFBA &- sfntChecksum(file)
+    if let hr = recs.first(where: { $0.tag == "head" }), hr.offset + 12 <= file.count {
+        let pos = hr.offset + 8
+        file[pos] = UInt8((adjustment >> 24) & 0xff)
+        file[pos + 1] = UInt8((adjustment >> 16) & 0xff)
+        file[pos + 2] = UInt8((adjustment >> 8) & 0xff)
+        file[pos + 3] = UInt8(adjustment & 0xff)
+    }
+    return Data(file)
+}
+
 func initPrefix() {
     guard let w = wineBinary else { return }
     
@@ -781,7 +1085,35 @@ func initPrefix() {
             }
         }
     }
-    
+
+    // 生成“中文族名”字体(修复 web view 公告标题豆腐块,原理见 sfntRebuild 上方注释)
+    // 以本机 Arial Unicode 为字模,重写 name 表为 Windows 常用中文字体族名。
+    // 放在 wineboot 之前,由 wineboot 扫描 Fonts 目录时自动注册这些族名。
+    let cjkModelCandidates = [
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+    ]
+    if let model = cjkModelCandidates.first(where: { fm.fileExists(atPath: $0) }),
+       let modelData = try? Data(contentsOf: URL(fileURLWithPath: model)) {
+        let jobs: [(en: String, zh: String, ps: String, file: String)] = [
+            ("Microsoft YaHei", "微软雅黑", "MicrosoftYaHei", "msyh_fix.ttf"),
+            ("SimSun", "宋体", "SimSun", "simsun_fix.ttf"),
+        ]
+        for j in jobs {
+            let dst = fontsDir.appendingPathComponent(j.file)
+            if fm.fileExists(atPath: dst.path) { continue }
+            let nameTable = sfntBuildNameTable(sfntMakeNameRecords(familyEn: j.en, familyZh: j.zh, ps: j.ps))
+            if let out = sfntRebuild(source: modelData, newNameTable: nameTable) {
+                do { try out.write(to: dst); log("生成中文字体: \(j.en)") }
+                catch { log("生成中文字体失败 \(j.en): \(error)") }
+            } else {
+                log("生成中文字体失败 \(j.en): sfnt 重建返回 nil")
+            }
+        }
+    } else {
+        log("未找到 Arial Unicode 字模,跳过中文字体生成(web view 中文可能显示为方块)")
+    }
+
     // wineboot 初始化 prefix（等它真正完成）
     log("执行 wineboot -u ...")
     let (code, output) = shell(w, ["wineboot", "-u"], env: buildEnv(), timeout: 120)
@@ -793,6 +1125,11 @@ func initPrefix() {
         shell(ws, ["-w"], env: buildEnv(), timeout: 60)
         log("wineserver 已完成")
     }
+    
+    // 安装原生运行时库（HLSL 编译器 + VC++ 运行时）到 system32
+    // 游戏运行时依赖这些原生库：内置替代实现无法编译部分着色器、且与游戏的
+    // C++ 对象二进制不兼容，缺失会导致着色器编译失败或纯虚函数调用崩溃。
+    installNativeRuntime()
     
     // 写字体注册表替换
     let userReg = winePrefix.appendingPathComponent("user.reg")
@@ -812,7 +1149,23 @@ func initPrefix() {
             log("字体注册表替换已写入")
         }
     }
-    
+
+    // 注册生成的中文字体到系统字体表。
+    // 此 Wine 只自动扫描 macOS 系统字体(Z:)，不扫描 C:\windows\Fonts，故须显式登记；
+    // 否则 DirectWrite(web view)按族名找不到文件，公告标题中文会显示为豆腐块。
+    let fontKey = "HKLM\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"
+    let fontRegs: [(name: String, file: String)] = [
+        ("Microsoft YaHei (TrueType)", "msyh_fix.ttf"),
+        ("微软雅黑 (TrueType)", "msyh_fix.ttf"),
+        ("SimSun (TrueType)", "simsun_fix.ttf"),
+        ("宋体 (TrueType)", "simsun_fix.ttf"),
+    ]
+    for reg in fontRegs where fm.fileExists(atPath: fontsDir.appendingPathComponent(reg.file).path) {
+        let _ = shell(w, ["reg", "add", fontKey, "/v", reg.name, "/t", "REG_SZ",
+                          "/d", "C:\\windows\\Fonts\\\(reg.file)", "/f"], env: buildEnv())
+    }
+    log("中文字体已注册到系统字体表")
+
     log("字体处理完成")
     
     // 写入初始化完成标记（checkPrefix 依赖此文件判断 prefix 完整性）
@@ -820,6 +1173,88 @@ func initPrefix() {
     try? "1".write(to: readyMarker, atomically: true, encoding: .utf8)
     log("prefix 初始化完成标记已写入")
 }
+
+// 将 wine-release/redist 下的原生运行时库拷贝进 prefix 的 system32。
+// Wine 默认加载顺序对这些库优先 native，放到 system32 即可被游戏加载，
+// 无需额外的 DllOverrides 注册表项。
+func installNativeRuntime() {
+    guard let r = wineRoot else { return }
+    let redistDir = URL(fileURLWithPath: r).appendingPathComponent("redist")
+    let system32 = winePrefix.appendingPathComponent("drive_c/windows/system32")
+    guard let files = try? fm.contentsOfDirectory(at: redistDir, includingPropertiesForKeys: nil) else {
+        log("redist 目录不存在，跳过原生运行时安装: \(redistDir.path)")
+        return
+    }
+    var count = 0
+    for src in files where src.pathExtension.lowercased() == "dll" {
+        let dst = system32.appendingPathComponent(src.lastPathComponent)
+        try? fm.removeItem(at: dst)
+        do {
+            try fm.copyItem(at: src, to: dst)
+            count += 1
+        } catch {
+            log("原生运行时拷贝失败 \(src.lastPathComponent): \(error)")
+        }
+    }
+    log("原生运行时安装完成，共 \(count) 个库 → system32")
+}
+
+// ============================================================
+// 注册 mshtml 的 TypeLib 条目
+// ============================================================
+// 游戏内嵌网页视图（登录 / 公告 / 活动面板，走 NtUniSdkNgWebview → ieframe →
+// mshtml → wine-gecko）由 Wine 内置的 mshtml 渲染。mshtml 初始化时（dispex.c
+// load_typelib）先用 LoadRegTypeLib 加载「公共」类型库 LIBID_MSHTML，失败会直接
+// 返回错误导致后续网页 dispex 全部崩溃（表现为进游戏/加载场景时 WINDOWS_NATIVE_ERROR）。
+//
+// 公共类型库是一个独立文件 mshtml.tlb（不是内嵌在 mshtml.dll 里的私有类型库）。
+// 早期打包脚本漏拷了所有 .tlb，导致 prefix 的 system32 里没有 mshtml.tlb，
+// 注册表即便指向 mshtml.dll 也无效（dll 里只有私有 tlb，LIBID 不匹配 → 8002801d）。
+//
+// 这里做两件事，且对存量 prefix 自愈：
+//   1. 若 system32 缺 mshtml.tlb，从 wine-release 拷进去；
+//   2. 注册表 4 个键指向 system32\mshtml.tlb。
+func ensureMshtmlTypeLib(_ w: String) {
+    let marker = winePrefix.appendingPathComponent(".mshtml_typelib_fixed_v2")
+    if fm.fileExists(atPath: marker.path) { return }
+
+    let system32 = winePrefix.appendingPathComponent("drive_c/windows/system32")
+    let tlb = system32.appendingPathComponent("mshtml.tlb")
+    let dll = system32.appendingPathComponent("mshtml.dll")
+    // mshtml.dll 缺失说明 prefix 尚未初始化完整，跳过（下次初始化好再补）
+    guard fm.fileExists(atPath: dll.path) else { return }
+
+    // 若 system32 缺 mshtml.tlb，从 wine-release 拷贝（存量 prefix 自愈的关键）
+    if !fm.fileExists(atPath: tlb.path), let r = wineRoot {
+        let srcTlb = URL(fileURLWithPath: r)
+            .appendingPathComponent("lib/wine/x86_64-windows/mshtml.tlb")
+        if fm.fileExists(atPath: srcTlb.path) {
+            try? fm.copyItem(at: srcTlb, to: tlb)
+            log("mshtml.tlb 已补入 system32")
+        }
+    }
+
+    // 类型库必须指向 mshtml.tlb（含公共 LIBID_MSHTML）；缺失才无奈回退 dll
+    let typelibPath = fm.fileExists(atPath: tlb.path)
+        ? "C:\\windows\\system32\\mshtml.tlb"
+        : "C:\\windows\\system32\\mshtml.dll"
+
+    let guidKey = "HKCR\\TypeLib\\{3050F1C5-98B5-11CF-BB82-00AA00BDCE0B}\\4.0"
+    shell(w, ["reg", "add", guidKey, "/ve", "/d", "Microsoft HTML Object Library", "/f"], env: buildEnv())
+    shell(w, ["reg", "add", "\(guidKey)\\0\\win64", "/ve", "/d", typelibPath, "/f"], env: buildEnv())
+    shell(w, ["reg", "add", "\(guidKey)\\FLAGS", "/ve", "/d", "0", "/f"], env: buildEnv())
+    shell(w, ["reg", "add", "\(guidKey)\\HELPDIR", "/ve", "/d", "C:\\windows\\system32", "/f"], env: buildEnv())
+
+    // 强制 wineserver 把改动落盘：默认要等客户端全退出数秒后才 flush，
+    // 若这期间进程被重启会丢失，显式 -w 等它写完再继续。
+    if let ws = wineserverBinary {
+        shell(ws, ["-w"], env: buildEnv())
+    }
+
+    try? "1".write(to: marker, atomically: true, encoding: .utf8)
+    log("mshtml TypeLib 已注册（修复内嵌网页视图崩溃，指向 \(typelibPath)）")
+}
+
 
 // ============================================================
 // 盘符管理：清理 DMG/App 挂载卷，保留 c:/z: + 外接设备
@@ -849,7 +1284,7 @@ func manageDriveLetters() {
     }
     
     // 要跳过的卷名（模拟器自身 DMG）
-    let appName = "燕云模拟器"
+    let appName = cfg.volumeSkipName
     // 获取启动盘挂载点（通常是 /），避免把它当外接设备
     let rootVolumePath = "/"
     
@@ -940,10 +1375,20 @@ func buildEnv() -> [String: String] {
     env["SSL_CERT_FILE"] = "/etc/ssl/cert.pem"
     env["QMLSCENE_DEVICE"] = "softwarecontext"
     if debugWineLog {
-        env["WINEDEBUG"] = "err+all,warn+module,warn+loaddll,warn+ntdll"
+        env["WINEDEBUG"] = "err+all,warn+module,+loaddll,warn+ntdll,+seh"
         env["WINE_DEBUG_LOG"] = "\(logsDir.path)/wine_debug.log"
+        // DXMT 自身日志：输出到 Logs 目录（每个进程一个 <exe>_d3d11.log 等）
+        // 用于排查进场景时哪个 Metal/D3D11 操作失败
+        env["DXMT_LOG_PATH"] = logsDir.path
+        env["DXMT_LOG_LEVEL"] = "trace"
     } else {
         env["WINEDEBUG"] = "-all"
+    }
+    // DXMT 崩溃复现调试：仅强制 DXMT。Metal 校验层(MTL_DEBUG_LAYER/
+    // MTL_SHADER_VALIDATION)极吃性能会把 launcher 拖到点不动，且那类 GPU 校验错
+    // 来自平台 webview 与游戏崩溃无关，故不再开启；崩溃归属改用 vmmap 取证脚本判定。
+    if debugDxmt {
+        env["SIM_BACKEND_OVERRIDE"] = "2"          // DXMT（调试对照用；正常发布 debugDxmt=false 不设此变量）
     }
     // env["MTL_HUD_ENABLED"] = "1"  // 关闭 Metal FPS HUD
     // Wine 内部路径（显式设置，避免依赖相对路径 fallback）
@@ -957,6 +1402,17 @@ func buildEnv() -> [String: String] {
     // .NET 7/8 兼容性修复（Rosetta 下 W^X 策略冲突）
     env["DOTNET_EnableWriteXorExecute"] = "0"
     // 不设 CX_GRAPHICS_BACKEND，由 winecompat 自动决定
+    // Metal 原生渲染路径（可选）：仅当公共 gptk 目录内存在该组件时才激活，
+    // 否则不设置，让 d3dmetal 后端安全回落到内置 vkd3d。GPTK 不随 App 分发，
+    // 存放于与 wine-prefix 同级的 gptk 目录，由用户自行放置。
+    let d3dsharedPath = gptkDir.appendingPathComponent("external/libd3dshared.dylib").path
+    if fm.fileExists(atPath: d3dsharedPath) {
+        env["GPTK_ROOT"] = gptkDir.path
+        env["CX_APPLEGPTK_LIBD3DSHARED_PATH"] = d3dsharedPath
+        // D3DMetal.framework 的 install_name 指向 /System/Library/Frameworks，
+        // 系统未安装时需把 framework 搜索路径重定向到 gptk 内的副本。
+        env["DYLD_FRAMEWORK_PATH"] = gptkDir.appendingPathComponent("external").path
+    }
     return env
 }
 
@@ -985,20 +1441,15 @@ func forceQuitWine() {
     try? p.run()
 }
 
-// 拉起已运行的游戏平台窗口到前台
-func bringFeverToFront() {
+// 拉起已运行的游戏平台窗口到前台（按 game 用 URL scheme 重新唤起对应游戏）
+func bringFeverToFront(_ game: Game) {
     guard let w = wineBinary else { return }
     let env = buildEnv()
     
-    // 重新执行启动命令：launcher 检测到已有实例会把窗口拉到前台
-    if let shortcutInfo = findGameShortcut(), let urlScheme = shortcutInfo.url {
-        if let (launcher, workDir) = findFeverLauncher() {
-            let _ = launchWineBackground(exe: w, args: [launcher, urlScheme], env: env, workDir: workDir)
-            log("重新调用 launcher 拉起窗口: \(urlScheme)")
-        }
-    } else if let (launcher, workDir) = findFeverLauncher() {
-        let _ = launchWineBackground(exe: w, args: [launcher], env: env, workDir: workDir)
-        log("重新调用 launcher 拉起窗口")
+    // 重新执行启动命令：launcher 检测到已有实例会把窗口拉到前台，并切换到对应游戏
+    if let (launcher, workDir) = findFeverLauncher() {
+        let _ = launchWineBackground(exe: w, args: [launcher, game.launchURL], env: env, workDir: workDir)
+        log("重新调用 launcher 拉起窗口: \(game.id) -> \(game.launchURL)")
     }
 }
 
@@ -1010,7 +1461,66 @@ func downloadInstaller() {
         showError("下载地址无效"); return
     }
 
-            showLoading("正在下载启动器...")
+    showLoading("正在获取下载地址...")
+
+    // 自动识别两种下载模式（无需手动配置）：
+    //   1) JSON 接口：响应体是 {"data":{"download_url":"..."}}，需解析后再下真实文件
+    //   2) 直链：响应体本身就是安装器（PE 可执行），直接落盘即可
+    // 正向判定 JSON：JSON 前缀固定为 '{'（跳过可能的前导空白/BOM）；
+    // 不是 '{' 一律按二进制安装器处理。HTTP 4xx/5xx 已由状态码校验拦下。
+    let task = URLSession.shared.downloadTask(with: url) { localURL, response, error in
+        if let error {
+            DispatchQueue.main.async { showError("获取下载失败: \(error.localizedDescription)") }
+            return
+        }
+        guard let httpResponse = response as? HTTPURLResponse else {
+            DispatchQueue.main.async { showError("获取下载失败（无响应）") }
+            return
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            DispatchQueue.main.async { showError("获取下载失败（HTTP \(httpResponse.statusCode)）") }
+            return
+        }
+        guard let src = localURL, let fh = try? FileHandle(forReadingFrom: src) else {
+            DispatchQueue.main.async { showError("下载失败") }
+            return
+        }
+        // 读开头若干字节，跳过前导空白/UTF-8 BOM，判断首个有效字符是否为 '{'
+        let head = fh.readData(ofLength: 16)
+        try? fh.close()
+        var bytes = [UInt8](head)
+        if bytes.count >= 3, bytes[0] == 0xEF, bytes[1] == 0xBB, bytes[2] == 0xBF {
+            bytes.removeFirst(3)  // 去掉 UTF-8 BOM
+        }
+        let firstNonSpace = bytes.first { $0 != 0x20 && $0 != 0x09 && $0 != 0x0A && $0 != 0x0D }
+        let isJSON = (firstNonSpace == 0x7B)  // '{'
+
+        if isJSON {
+            // JSON 接口模式：解析 data.download_url 后下载真实文件
+            guard let data = try? Data(contentsOf: src),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let dataObj = json["data"] as? [String: Any],
+                  let downloadURLString = dataObj["download_url"] as? String,
+                  let downloadURL = URL(string: downloadURLString) else {
+                log("JSON 接口解析失败: \(String(data: (try? Data(contentsOf: src)) ?? Data(), encoding: .utf8)?.prefix(200) ?? "")")
+                DispatchQueue.main.async { showError("解析下载地址失败") }
+                return
+            }
+            log("检测到 JSON 接口模式，解析到安装器下载地址: \(downloadURLString)")
+            downloadInstallerFile(from: downloadURL)
+            return
+        }
+
+        // 直链模式：响应体即安装器，直接保存
+        log("检测到直链模式，响应体即安装器")
+        saveInstaller(from: src)
+    }
+    task.resume()
+}
+
+/// 第二步：下载真实的安装器文件并保存到 installerPath（JSON 接口模式使用）
+func downloadInstallerFile(from url: URL) {
+    DispatchQueue.main.async { showLoading("正在下载启动器...") }
 
     let task = URLSession.shared.downloadTask(with: url) { localURL, response, error in
         if let error {
@@ -1025,23 +1535,63 @@ func downloadInstaller() {
             DispatchQueue.main.async { showError("下载失败") }
             return
         }
-        try? fm.removeItem(at: installerPath)
-        do {
-            try fm.moveItem(at: src, to: installerPath)
-            // 移除 extended attributes（防止 Gatekeeper 阻止 Wine 读取）
-            shell("/usr/bin/xattr", ["-cr", installerPath.path])
-            DispatchQueue.main.async { installFever() }
-        } catch {
-            DispatchQueue.main.async { showError("保存安装器失败") }
-        }
+        saveInstaller(from: src)
     }
     task.resume()
 }
 
+/// 将下载到的临时文件保存为安装器并触发安装（两种模式共用）
+func saveInstaller(from src: URL) {
+    try? fm.removeItem(at: installerPath)
+    do {
+        try fm.moveItem(at: src, to: installerPath)
+        // 移除 extended attributes（防止 Gatekeeper 阻止 Wine 读取）
+        shell("/usr/bin/xattr", ["-cr", installerPath.path])
+        DispatchQueue.main.async { installFever() }
+    } catch {
+        DispatchQueue.main.async { showError("保存安装器失败") }
+    }
+}
+
+/// 预启动带 SO_SNDBUF 注入的 wineserver（修复游戏平台客户端下载 IPC 死锁）
+///
+/// 原理：wineserverfix.so 通过 DYLD_INSERT_LIBRARIES 注入 wineserver，拦截 socket()
+/// 为 loopback TCP 设置 2MB 发送缓冲，规避 IPC 首次自发自收 1MB 在
+/// macOS 默认 128KB loopback 缓冲下的单线程死锁。
+///
+/// 注意：wineserver 是每个 WINEPREFIX 的单例。必须先杀掉旧实例，再启动带注入的常驻
+/// 实例（-p），随后启动的 wine 客户端才会复用它。本函数含阻塞等待，请在后台线程调用。
+func ensureInjectedWineserver() {
+    guard let ws = wineserverBinary, let r = wineRoot else { return }
+    let shimPath = r + "/lib/wine/x86_64-unix/wineserverfix.so"
+    guard fm.fileExists(atPath: shimPath) else {
+        log("wineserverfix.so 不存在，跳过注入（下载可能死锁）")
+        return
+    }
+    // 杀掉当前 prefix 的旧 wineserver（-k 会等待其真正退出），确保带注入的新实例接管
+    let _ = shell(ws, ["-k"], env: buildEnv())
+    // 带 DYLD_INSERT 预启动常驻 wineserver
+    var env = buildEnv()
+    env["DYLD_INSERT_LIBRARIES"] = shimPath
+    let _ = launchWineBackground(exe: ws, args: ["-p"], env: env)
+    // 等待常驻 server 就绪，避免后续 wine 客户端抢先自行 spawn 未注入的 server
+    Thread.sleep(forTimeInterval: 2)
+    log("已预启动带 SNDBUF 注入的 wineserver（下载死锁修复）")
+}
+
 func installFever() {
-    guard let w = wineBinary else { showError("Wine 不可用"); return }
+    guard wineBinary != nil else { showError("Wine 不可用"); return }
     guard fm.fileExists(atPath: installerPath.path) else { showError("安装器未找到"); return }
-            showLoading("正在安装启动器...")
+    showLoading("正在安装启动器...")
+    // 先在后台预启动带注入的 wineserver，再执行安装（安装器会自动拉起平台）
+    DispatchQueue.global().async {
+        ensureInjectedWineserver()
+        DispatchQueue.main.async { installFeverCore() }
+    }
+}
+
+func installFeverCore() {
+    guard let w = wineBinary else { showError("Wine 不可用"); return }
 
     // Wine 需要 Windows 路径格式来处理带空格的路径
     let winInstallerPath = "Z:" + installerPath.path.replacingOccurrences(of: "/", with: "\\")
@@ -1106,73 +1656,33 @@ func installFever() {
     }
 }
 
-func findGameShortcut() -> (path: String, url: String?)? {
-    // 在 prefix 桌面目录中查找快捷方式
-    let desktopDirs = [
-        winePrefix.appendingPathComponent("drive_c/users/crossover/Desktop"),
-        winePrefix.appendingPathComponent("drive_c/users/Public/Desktop"),
-    ]
-    
-    // 先找 .url 文件，解析出 URL scheme（用于传参给 launcher）
-    for dir in desktopDirs {
-        if let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
-            for f in files where f.pathExtension == "url" {
-                if let content = try? String(contentsOf: f, encoding: .utf8),
-                   let urlLine = content.components(separatedBy: "\n").first(where: { $0.hasPrefix("URL=") }) {
-                    let url = String(urlLine.dropFirst(4)).trimmingCharacters(in: .whitespacesAndNewlines)
-                    log("找到桌面 .url 快捷方式: \(f.lastPathComponent), URL=\(url)")
-                    return (f.path, url)
-                }
-            }
-        }
+func launchGame(_ game: Game) {
+    guard wineBinary != nil else { showError("Wine 不可用"); return }
+    showLoading("正在启动游戏...")
+    // 先在后台预启动带注入的 wineserver，再启动游戏平台
+    DispatchQueue.global().async {
+        ensureInjectedWineserver()
+        DispatchQueue.main.async { launchGameCore(game) }
     }
-    
-    // fallback: .lnk
-    for dir in desktopDirs {
-        if let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
-            for f in files where f.pathExtension == "lnk" {
-                log("找到桌面快捷方式(.lnk): \(f.path)")
-                return (f.path, nil)
-            }
-        }
-    }
-    return nil
 }
 
-func launchGame() {
+func launchGameCore(_ game: Game) {
     guard let w = wineBinary else { showError("Wine 不可用"); return }
-    
-    showLoading("正在启动游戏...")
     let env = buildEnv()
     
-    // 策略：从桌面 .url 快捷方式解析出 URL scheme，传给 FeverGamesLauncher.exe 作为参数
-    // 带参数启动可以直接进入游戏页面
-    if let shortcutInfo = findGameShortcut(), let urlScheme = shortcutInfo.url {
-        // 方式1: 找到 launcher exe，把 URL 当命令行参数传入
-        if let (launcher, workDir) = findFeverLauncher() {
-            log("启动游戏: \(launcher) 参数: \(urlScheme)")
-            if let _ = launchWineBackground(exe: w, args: [launcher, urlScheme], env: env, workDir: workDir) {
-                log("Launcher + URL scheme 启动命令已执行")
-            } else {
-                log("启动失败，尝试 fallback（无 URL 参数）")
-                if !launchGameFallback(w: w, env: env) { return }
-            }
+    // 策略：把 fevergames:// URL scheme 作为命令行参数传给 launcher，
+    // launcher 据 gameId 直接进入对应游戏页面（燕云=37，遗忘之海=66）
+    if let (launcher, workDir) = findFeverLauncher() {
+        log("启动游戏 \(game.id): \(launcher) 参数: \(game.launchURL)")
+        if let _ = launchWineBackground(exe: w, args: [launcher, game.launchURL], env: env, workDir: workDir) {
+            log("Launcher + URL scheme 启动命令已执行")
         } else {
-            // 没找到 launcher，尝试用 start /unix .lnk
-            log("未找到 launcher exe，尝试 start /unix .lnk")
-            if !launchGameFallback(w: w, env: env) { return }
-        }
-    } else if let shortcutInfo = findGameShortcut() {
-        // 只有 .lnk 没有 .url，用 start /unix 打开 .lnk
-        log("启动游戏: 使用 .lnk 快捷方式: \(shortcutInfo.path)")
-        if let _ = launchWineBackground(exe: w, args: ["start", "/unix", shortcutInfo.path], env: env) {
-            log("Wine start /unix .lnk 启动命令已执行")
-        } else {
+            log("启动失败，尝试 fallback（无参数）")
             if !launchGameFallback(w: w, env: env) { return }
         }
     } else {
-        // 没有任何快捷方式，直接运行 launcher
-        log("未找到桌面快捷方式，使用 fallback 方式启动")
+        // 没找到 launcher exe，走 fallback
+        log("未找到 launcher exe，使用 fallback 方式启动")
         if !launchGameFallback(w: w, env: env) { return }
     }
 
@@ -1268,9 +1778,12 @@ func launchGameFallback(w: String, env: [String: String]) -> Bool {
 // ============================================================
 // 启动流程
 // ============================================================
-func startLaunch() {
+func startLaunch(_ game: Game) {
     state = .loading
-    log("===== 启动流程开始 =====")
+    // 立刻显示遮罩给出反馈：后续 wineserver 检查、注册表补写等同步操作耗时，
+    // 若不先上遮罩，已初始化过的 prefix 会有一段无反馈空窗（用户以为卡死）。
+    showLoading("正在准备运行环境...")
+    log("===== 启动流程开始: \(game.id) =====")
 
     DispatchQueue.global(qos: .userInitiated).async {
         // 先杀掉残留的 wineserver（确保新环境变量生效）
@@ -1281,23 +1794,6 @@ func startLaunch() {
         Thread.sleep(forTimeInterval: 1)
         
         guard verifyWine() else { return }
-        
-        // AVX 诊断：检查环境变量是否正确设置
-        let env = buildEnv()
-        log("[AVX诊断] ROSETTA_ADVERTISE_AVX=\(env["ROSETTA_ADVERTISE_AVX"] ?? "未设置")")
-        
-        // 用 Wine 环境运行一个简单命令，确认 env 可以传递到 x86_64 进程
-        if let w = wineBinary {
-            let (_, envCheck) = shell("/bin/bash", ["-c", "echo ROSETTA=$ROSETTA_ADVERTISE_AVX"], env: env)
-            log("[AVX诊断] bash 内 ROSETTA=\(envCheck.trimmingCharacters(in: .whitespacesAndNewlines))")
-            
-            // 用 check_avx 二进制直接测试 CPUID（如果存在）
-            let checkAvx = "/tmp/check_avx"
-            if fm.fileExists(atPath: checkAvx) {
-                let (_, avxOut) = shell(checkAvx, [], env: env)
-                log("[AVX诊断] check_avx 输出: \(avxOut.trimmingCharacters(in: .whitespacesAndNewlines))")
-            }
-        }
 
         if !checkPrefix() {
             showLoading("正在初始化 Wine 环境...")
@@ -1308,12 +1804,19 @@ func startLaunch() {
             log("prefix 已存在，跳过初始化")
         }
 
+        // 补注册 mshtml TypeLib，修复登录网页窗口崩溃（新老 prefix 都覆盖，幂等）
+        // 首次会跑 4 次 reg add + wineserver -w，耗时数秒；标记门控，之后秒过。
+        if let w = wineBinary {
+            showLoading("正在检查运行环境...")
+            ensureMshtmlTypeLib(w)
+        }
+
         // 盘符管理：映射外接设备到 Wine 盘符
         manageDriveLetters()
 
         if checkFeverInstalled() {
             log("游戏平台已安装，直接启动")
-            DispatchQueue.main.async { launchGame() }
+            DispatchQueue.main.async { launchGame(game) }
         } else {
             log("游戏平台未安装，开始下载")
             DispatchQueue.main.async { downloadInstaller() }

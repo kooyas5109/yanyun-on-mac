@@ -2,7 +2,7 @@
  * winecompat - Wine 进程兼容扩展
  *
  * 功能：
- *   - 根据进程 exe 路径选择图形渲染后端（dxmt / d3dmetal / wined3d）
+ *   - 根据进程 exe 路径选择图形渲染后端（dxmt / vkd3d / d3dmetal / wined3d）
  *   - 通过 Wine syscall 表 hook 在子进程创建时注入命令行参数和环境变量
  *   - yysls.exe 进程内监控窗口 Level，使跨进程弹窗和进程内弹窗可见
  *
@@ -139,6 +139,42 @@ static void load_backend_dll_dir(const char *relative_path) {
 #endif
     prepend_dll_path_fn(full_path);
     /* 注意：不 free full_path，因为 dll_paths 数组会持有这个指针 */
+}
+
+/* apply_d3d11_native_overrides: 对 dxgi/d3d11/d3d10core 设置 native,builtin 加载顺序。
+ * dxmt 与 dxvk 均以 PE DLL 提供这三个组件，需显式覆盖加载顺序让 Wine 优先加载 prepend
+ * 路径中的 PE DLL；d3d12 不覆盖，交给内置 vkd3d。
+ * d3dcompiler_47 同样设为 native 优先：redist 已把真实 HLSL 编译器拷进 system32，
+ * Wine 内置版功能残缺会导致复杂 shader(如 TSAA)编译失败；native 缺失时回落 builtin，无副作用。*/
+static void apply_d3d11_native_overrides(void (*add_override)(const WCHAR *)) {
+    if (!add_override) return;
+    const char *names[] = {
+        "dxgi=native,builtin",
+        "d3d11=native,builtin",
+        "d3d10core=native,builtin",
+        "d3dcompiler_47=native,builtin",
+    };
+    const int count = (int)(sizeof(names) / sizeof(names[0]));
+    for (int n = 0; n < count; n++) {
+        WCHAR ovr[64];
+        const char *s = names[n];
+        int i = 0;
+        for (; s[i]; i++) ovr[i] = (unsigned char)s[i];
+        ovr[i] = 0;
+        add_override(ovr);
+    }
+}
+
+/* prepend_dll_dir_abs: 将一个绝对路径目录加入 Wine 的 DLL 搜索路径头部 */
+static void prepend_dll_dir_abs(const char *abs_path) {
+    if (!prepend_dll_path_fn || !abs_path || !abs_path[0]) return;
+    char *dup = strdup(abs_path);
+    if (!dup) return;
+#ifdef DEBUG
+    fprintf(stderr, "[compat] prepend abs path: %s\n", dup);
+#endif
+    prepend_dll_path_fn(dup);
+    /* 不 free：dll_paths 数组会持有该指针 */
 }
 
 /* ========== NtCreateUserProcess Hook ========== */
@@ -600,6 +636,153 @@ static void start_game_level_monitor(void) {
     pthread_attr_destroy(&attr);
 }
 
+/* ========== DXMT 纯虚崩溃热修复 ==========
+ *
+ * 现象：ywzh 特定场景（如 16850）在 DXMT 后端下必崩，
+ *   c000001d(EXCEPTION_ILLEGAL_INSTRUCTION) @ d3d11.dll __cxa_pure_virtual 的 ud2。
+ *
+ * 根因（崩溃取证反推，见 docs）：
+ *   dxmt d3d11.dll 的 BlitObject 构造函数首行执行 pResource->GetType(&Dimension)。
+ *   传入的 ID3D11Resource 其 vptr 指向抽象基类 D3D11ResourceCommon 的 vtable
+ *   （GetType 在该基类里是纯虚，仅派生 TResourceBase 才 final override）。
+ *   即对象处于「析构中(vptr 已回退到基类)」或「已释放内存被复用」状态——
+ *   游戏在拷贝类 API(CopyResource/CopySubresourceRegion/Resolve/Update) 里
+ *   引用了已 Release 的 resource（use-after-free / 析构竞态）。
+ *   命中纯虚槽 → __cxa_pure_virtual → __builtin_trap() → ud2 → 硬崩。
+ *
+ * 修复（不改 dxmt 源码，运行时内存补丁）：
+ *   把 D3D11ResourceCommon 基类 vtable 的 GetType 槽改指向安全 stub，
+ *   写入 D3D11_RESOURCE_DIMENSION_UNKNOWN(0) 后返回。BlitObject 遇 UNKNOWN
+ *   走 switch default(break)，FormatDescription 保持空 → 后续拷贝被判 Invalid
+ *   而跳过，避免硬崩。只改这一个槽，其它纯虚调用仍照常 trap（不掩盖真 bug）。
+ *
+ * 稳定性：RVA 由当前 dxmt d3d11.dll 反推硬编码；dxmt 升级可能漂移，
+ *   打补丁前用 Itanium ABI typeinfo 名校验，不匹配则跳过（宁可不修不乱改）。
+ */
+
+/* GetType 签名：void GetType(this, D3D11_RESOURCE_DIMENSION* out)
+ * PE 侧以 Microsoft x64 调用约定调用（this=rcx, out=rdx），
+ * stub 必须声明 ms_abi 才能正确取到参数。写 0 = D3D11_RESOURCE_DIMENSION_UNKNOWN。*/
+static void __attribute__((ms_abi)) dxmt_gettype_safe_stub(void *thisptr, unsigned int *out) {
+    (void)thisptr;
+    if (out) *out = 0;
+}
+
+/* 对象持有的 vptr 值相对 d3d11.dll 基址的 RVA（= vtable 符号 +0x10，跳过
+ * offset-to-top 与 typeinfo 指针）。GetType 在 ID3D11Resource 布局中位于
+ * IUnknown(3 槽) + ID3D11DeviceChild(4 槽) 之后 = index7 = 偏移 0x38。*/
+#define DXMT_RESCOMMON_VPTR_RVA   0x31a480
+#define DXMT_GETTYPE_SLOT_OFF     0x38
+
+/* 从 PEB Loader 链表按文件名后缀查找已加载 PE 模块基址。
+ * peb 由构造函数（wine 主线程，TEB 有效）读出后传入——本函数在我们自建的
+ * 原生 pthread 中运行，该线程无 wine TEB，不能调用 NtCurrentTeb()。
+ * 结构偏移（x86_64）：
+ *   PEB+0x18 = Ldr (PEB_LDR_DATA*)
+ *   Ldr+0x10 = InLoadOrderModuleList (LIST_ENTRY 头)
+ *   LDR_DATA_TABLE_ENTRY: +0x30 DllBase, +0x58 BaseDllName.Length, +0x60 .Buffer
+ * 定义见 Wine include/winternl.h 与 Windows SDK 公开文档。*/
+static void *find_pe_module_base(void *peb_ptr, const char *dll_name_suffix) {
+    char *peb = (char *)peb_ptr;
+    if (!peb) return NULL;
+    char *ldr = *(char **)(peb + 0x18);
+    if (!ldr) return NULL;
+    char *head = ldr + 0x10;
+    char *node = *(char **)head;
+    int guard = 0;
+#ifdef DEBUG
+    static int call_no = 0;
+    int do_dump = (++call_no == 10);  /* 约 2s 后 d3d11 应已加载，dump 一次 */
+    if (do_dump) fprintf(stderr, "[compat] PEB walk#%d: ldr=%p head=%p first=%p\n", call_no, ldr, head, node);
+#endif
+    while (node && node != head && guard++ < 1024) {
+        void *dll_base = *(void **)(node + 0x30);
+        unsigned short name_len = *(unsigned short *)(node + 0x58);
+        WCHAR *name_buf = *(WCHAR **)(node + 0x60);
+#ifdef DEBUG
+        if (do_dump && name_buf && name_len > 0) {
+            char nm[64] = {0}; int wl = name_len / 2; if (wl > 62) wl = 62;
+            for (int i = 0; i < wl; i++) { WCHAR c = name_buf[i]; nm[i] = (c > 0 && c < 128) ? (char)c : '?'; }
+            fprintf(stderr, "[compat] PEB mod: base=%p len=%u name=%s\n", dll_base, name_len, nm);
+        }
+#endif
+        if (dll_base && name_buf && name_len > 0) {
+            if (wstr_ends_with_icase(name_buf, name_len / 2, dll_name_suffix))
+                return dll_base;
+        }
+        node = *(char **)node;  /* InLoadOrderLinks.Flink → 下一条目 */
+    }
+    return NULL;
+}
+
+/* 校验 vptr 确为 D3D11ResourceCommon 的 vtable（Itanium C++ ABI）：
+ * vptr[-1] = typeinfo*；type_info+0x08 = 名字字符串指针（如
+ * "N4dxmt19D3D11ResourceCommonE"）。名字含 "D3D11ResourceCommon" 即认为匹配。*/
+static int verify_rescommon_vtable(void **vptr) {
+    void *typeinfo = vptr[-1];
+    if (!typeinfo) return 0;
+    const char *name = *(const char **)((char *)typeinfo + 8);
+    if (!name) return 0;
+    return strstr(name, "D3D11ResourceCommon") != NULL;
+}
+
+static void patch_dxmt_pure_virtual(void *dll_base) {
+    void **vptr = (void **)((char *)dll_base + DXMT_RESCOMMON_VPTR_RVA);
+    if (!verify_rescommon_vtable(vptr)) {
+#ifdef DEBUG
+        fprintf(stderr, "[compat] dxmt vtable verify failed, skip pure-virtual patch\n");
+#endif
+        return;
+    }
+    void **slot = (void **)((char *)vptr + DXMT_GETTYPE_SLOT_OFF);
+    long ps = getpagesize();
+    void *pg = (void *)((unsigned long long)slot & ~(unsigned long long)(ps - 1));
+    if (mprotect(pg, ps * 2, PROT_READ | PROT_WRITE) != 0) return;
+    *slot = (void *)dxmt_gettype_safe_stub;
+    mprotect(pg, ps * 2, PROT_READ);
+#ifdef DEBUG
+    fprintf(stderr, "[compat] dxmt GetType slot patched -> safe stub (base=%p)\n", dll_base);
+#endif
+}
+
+/* 后台线程：轮询等待 d3d11.dll 加载后打一次补丁即退出（最长约 10 分钟）。
+ * arg = 构造函数传入的 PEB 指针（进程级，跨线程有效）。 */
+static void *dxmt_purevirt_patch_thread(void *arg) {
+    void *peb = arg;
+#ifdef DEBUG
+    fprintf(stderr, "[compat] purevirt patch thread started (peb=%p)\n", peb);
+#endif
+    for (int i = 0; i < 3000; i++) {
+        void *base = find_pe_module_base(peb, "d3d11.dll");
+        if (base) {
+            patch_dxmt_pure_virtual(base);
+            return NULL;
+        }
+        usleep(200000);  /* 200ms */
+    }
+#ifdef DEBUG
+    fprintf(stderr, "[compat] d3d11.dll not loaded in time, pure-virtual patch skipped\n");
+#endif
+    return NULL;
+}
+
+static void start_dxmt_purevirt_patch(void) {
+    /* 在构造函数（wine 主线程）读取 PEB，传给工作线程；工作线程无 wine TEB。 */
+    PVOID (*NtCurrentTeb_fn)(void) = dlsym(RTLD_DEFAULT, "NtCurrentTeb");
+    if (!NtCurrentTeb_fn) return;
+    PVOID teb = NtCurrentTeb_fn();
+    if (!teb) return;
+    void *peb = *(void **)((char *)teb + 0x60);
+    if (!peb) return;
+
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&tid, &attr, dxmt_purevirt_patch_thread, peb);
+    pthread_attr_destroy(&attr);
+}
+
 /* ========== 入口点 ========== */
 
 __attribute__((constructor))
@@ -623,7 +806,9 @@ static void init_winecompat(void) {
 
     /*
      * Step 1: 按 exe 路径匹配图形后端
-     * yysls.exe 和 wwm.exe 使用 dxmt（Metal 原生图形层）
+     * 已适配 dxmt（Metal 原生图形层）的进程走 backend=2。
+     * dxmt 以 PE DLL 形式提供 d3d11/d3d10core/dxgi，需显式 native override
+     * 让 Wine 优先加载 prepend 目录（lib/dxmt）中的 PE DLL。
      */
     int backend = 0;  /* 0=未决定 */
 
@@ -631,6 +816,25 @@ static void init_winecompat(void) {
         if (wstr_ends_with_icase(exe_path, wchar_len, "\\yysls.exe") ||
             wstr_ends_with_icase(exe_path, wchar_len, "\\wwm.exe")) {
             backend = 2;  /* dxmt */
+        } else if (wstr_ends_with_icase(exe_path, wchar_len, "\\ywzh.exe")) {
+            /*
+             * ywzh 走 dxmt。历史上进特定场景(如 16850)会命中 dxmt d3d11.dll 的
+             * 纯虚调用崩溃(BlitObject 对已析构 resource 调 GetType)，现已由
+             * start_dxmt_purevirt_patch() 运行时热修复，dxmt 可稳定使用。
+             */
+            backend = 2;  /* dxmt */
+        }
+    }
+
+    /*
+     * 调试覆盖：环境变量 SIM_BACKEND_OVERRIDE 若设置，直接指定后端编号，
+     * 覆盖上面按 exe 名匹配的结果（正常启动不设此变量）。
+     * 用于对照测试，例如强制某游戏走 DXMT：SIM_BACKEND_OVERRIDE=2。
+     */
+    {
+        const char *ov = getenv("SIM_BACKEND_OVERRIDE");
+        if (ov && ov[0]) {
+            backend = atoi(ov);
         }
     }
 
@@ -669,34 +873,49 @@ static void init_winecompat(void) {
         /*
          * DXMT 通过 PE DLL (x86_64-windows/d3d11.dll) 工作，
          * 需要显式设置 native load order 让 Wine 优先加载 prepend 路径中的 PE DLL。
-         * 某些 Wine 构建可能通过内部补丁隐式实现了这一点，
-         * 但我们的 build 需要显式调用。
-         * 注意：只对 dxmt 调用，d3dmetal 不需要（它通过 Unix .so 层工作）。
+         * 注意：只对 dxmt/dxvk 调用，d3dmetal 不需要（它通过 Unix .so 层工作）。
          */
-        if (add_load_order_override_fn) {
-            WCHAR ovr[64];
-            /* dxgi=native,builtin */
-            const char *s1 = "dxgi=native,builtin";
-            for (int i = 0; s1[i]; i++) ovr[i] = (unsigned char)s1[i]; ovr[19] = 0;
-            add_load_order_override_fn(ovr);
-            /* d3d11=native,builtin */
-            const char *s2 = "d3d11=native,builtin";
-            for (int i = 0; s2[i]; i++) ovr[i] = (unsigned char)s2[i]; ovr[20] = 0;
-            add_load_order_override_fn(ovr);
-            /* d3d10core=native,builtin */
-            const char *s3 = "d3d10core=native,builtin";
-            for (int i = 0; s3[i]; i++) ovr[i] = (unsigned char)s3[i]; ovr[24] = 0;
-            add_load_order_override_fn(ovr);
-        }
+        apply_d3d11_native_overrides(add_load_order_override_fn);
+        break;
+    case 6:  /* dxvk：d3d11/d3d10core/dxgi → SPIR-V → winevulkan → MoltenVK → Metal */
+        backend_name = "dxvk";
+        backend_path = "lib/dxvk";
+        /* 与 dxmt 相同：PE DLL 提供 dx11 三件套，需 native override；d3d12 仍走内置 vkd3d */
+        apply_d3d11_native_overrides(add_load_order_override_fn);
         break;
     case 3:  /* d3dmetal */
         backend_name = "d3dmetal";
-        backend_path = "lib64/apple_gptk/wine";
+        backend_path = NULL;  /* GPTK 在外部公共目录，用绝对路径 prepend（见下） */
+        /*
+         * GPTK_ROOT 由启动方在检测到外部 gptk 目录时设置（不随 App 分发）。
+         * 存在则 prepend "$GPTK_ROOT/wine"（内含 x86_64-windows/d3d12.dll 等 PE DLL），
+         * Wine 会优先加载 Metal 原生版；未设置则不 prepend，游戏回落内置 vkd3d。
+         */
+        {
+            const char *gptk_root = getenv("GPTK_ROOT");
+            if (gptk_root && gptk_root[0]) {
+                char *p = NULL;
+                if (asprintf(&p, "%s/wine", gptk_root) != -1) {
+                    prepend_dll_dir_abs(p);
+                    free(p);
+                }
+            }
+        }
         break;
     case 1:  /* wined3d */
     default:
         backend_name = "wined3d";
         backend_path = NULL;  /* 不 prepend */
+        break;
+    case 5:  /* vkd3d */
+        /*
+         * vkd3d = Wine 内置 d3d12.dll / d3d12core.dll（源码内 vkd3d-proton）。
+         * 内置 DLL 走默认加载顺序即可，无需 prepend 目录、无需 native override。
+         * 链路：game D3D12 → d3d12.dll(vkd3d) → winevulkan → libMoltenVK → Metal。
+         * 全部为开源组件（LGPL / Apache），可随 App 分发。
+         */
+        backend_name = "vkd3d";
+        backend_path = NULL;  /* 不 prepend，用内置 */
         break;
     }
 
@@ -706,6 +925,15 @@ static void init_winecompat(void) {
     /* prepend_dll_path - wined3d 时不 prepend */
     if (backend_path) {
         load_backend_dll_dir(backend_path);
+    }
+
+    /*
+     * DXMT 纯虚崩溃热修复：仅 dxmt 后端进程启动后台线程，
+     * 等 d3d11.dll 加载后把 D3D11ResourceCommon::GetType 纯虚槽改指向安全 stub。
+     * 见上方「DXMT 纯虚崩溃热修复」注释。
+     */
+    if (backend == 2) {
+        start_dxmt_purevirt_patch();
     }
 
     /*

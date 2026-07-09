@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>appIdentifier</key>
+	<string>ywzh.simulator</string>
+	<key>feverDownloadURL</key>
+	<string>https://loadingbaycn.webapp.163.com/app/v1/download_client/windows/mkt-h74-official:netease.uubooster02pc_cps_dev/url</string>
+	<key>gameId</key>
+	<integer>66</integer>
+	<key>gameKey</key>
+	<string>ywzh</string>
+	<key>title</key>
+	<string>遗忘之海</string>
+	<key>windowTitle</key>
+	<string>遗忘之海模拟器</string>
+	<key>aboutTitle</key>
+	<string>关于遗忘之海模拟器</string>
+	<key>volumeSkipName</key>
+	<string>遗忘之海模拟器</string>
+	<key>qqGroup</key>
+	<string>1080300274</string>
+	<key>productName</key>
+	<string>遗忘之海模拟器</string>
+</dict>
+</plist>

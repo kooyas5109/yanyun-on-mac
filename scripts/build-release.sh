@@ -12,13 +12,57 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_DIR="$REPO_ROOT/app"
 BUILD_DIR="$APP_DIR/build"
-APP="$HOME/Desktop/Yanyun.app"
-DMG="$HOME/Desktop/Yanyun.dmg"
+TARGETS_DIR="$APP_DIR/targets"
+
+# 输出目录由环境变量 OUTPUT_DIR 指定，未配置则报错退出
+if [ -z "${OUTPUT_DIR:-}" ]; then
+    echo "❌ 未配置输出目录，请设置环境变量 OUTPUT_DIR，例如："
+    echo "   OUTPUT_DIR=~/Desktop bash scripts/build-release.sh"
+    exit 1
+fi
+
+# ---- 解析出包目标 ----
+# 第一个位置参数为目标名（如 ywzh）；未指定则列出 targets/ 下的目录交互选择
+TARGET="${1:-}"
+if [ -z "$TARGET" ]; then
+    echo "未指定出包目标，请选择（对应 app/targets/ 下的目录）："
+    avail=()
+    for d in "$TARGETS_DIR"/*/; do [ -d "$d" ] && avail+=("$(basename "$d")"); done
+    if [ ${#avail[@]} -eq 0 ]; then echo "❌ $TARGETS_DIR 下没有任何 target"; exit 1; fi
+    select t in "${avail[@]}"; do
+        if [ -n "$t" ]; then TARGET="$t"; break; fi
+    done
+fi
+
+TARGET_DIR="$TARGETS_DIR/$TARGET"
+if [ ! -d "$TARGET_DIR" ]; then
+    echo "❌ target 不存在: $TARGET_DIR"
+    exit 1
+fi
+# 校验必需文件齐全
+for f in config.plist Info.plist AppIcon.icns game-icon.png faq.txt; do
+    if [ ! -f "$TARGET_DIR/$f" ]; then
+        echo "❌ target [$TARGET] 缺少必需文件: $f"
+        exit 1
+    fi
+done
+
+# 产物名来自 target 配置（App / DMG / 卷名统一使用）
+PRODUCT_NAME=$(/usr/libexec/PlistBuddy -c "Print :productName" "$TARGET_DIR/config.plist" 2>/dev/null || true)
+if [ -z "$PRODUCT_NAME" ]; then
+    echo "❌ $TARGET_DIR/config.plist 缺少 productName"
+    exit 1
+fi
+echo "   出包目标: $TARGET  →  $PRODUCT_NAME"
+
+APP="$OUTPUT_DIR/$PRODUCT_NAME.app"
+DMG="$OUTPUT_DIR/$PRODUCT_NAME.dmg"
 SIGN_ID="${SIGN_ID:-Developer ID Application}"  # 可通过环境变量覆盖，或直接填写你的签名身份
 ENTITLEMENTS="$APP_DIR/Simulator/Simulator.entitlements"
 STAGE="/tmp/dmg-stage"
 
 mkdir -p "$BUILD_DIR"
+mkdir -p "$OUTPUT_DIR"
 
 # ---- 前置检查 ----
 echo "=== 0. 前置检查 ==="
@@ -55,7 +99,7 @@ echo "   create-dmg: ✅"
 echo ""
 
 echo "============================================"
-echo "  燕云模拟器 - 正式打包"
+echo "  $PRODUCT_NAME - 正式打包"
 echo "============================================"
 echo ""
 
@@ -64,11 +108,13 @@ echo "=== 1. 编译 Universal Binary ==="
 cd "$APP_DIR"
 swiftc -O -o "$BUILD_DIR/Simulator-arm64" \
   -target arm64-apple-macosx14.0 \
+  -file-prefix-map "$REPO_ROOT=." \
   Simulator/main.swift \
   -framework Cocoa -framework AppKit
 
 swiftc -O -o "$BUILD_DIR/Simulator-x86_64" \
   -target x86_64-apple-macosx14.0 \
+  -file-prefix-map "$REPO_ROOT=." \
   Simulator/main.swift \
   -framework Cocoa -framework AppKit
 
@@ -80,6 +126,9 @@ file "$BUILD_DIR/Simulator"
 echo "=== 2. 编译 winecompat ==="
 bash "$REPO_ROOT/wine/winecompat/build.sh"
 
+echo "=== 2.1 编译 wineserverfix ==="
+bash "$REPO_ROOT/wine/wineserverfix/build.sh"
+
 # ---- Step 2: 构建 App Bundle ----
 echo "=== 3. 构建 App Bundle ==="
 rm -rf "$APP"
@@ -87,9 +136,11 @@ mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
 
 cp "$BUILD_DIR/Simulator" "$APP/Contents/MacOS/Simulator"
-cp "$APP_DIR/Simulator/Info.plist" "$APP/Contents/"
-cp "$APP_DIR/Simulator/AppIcon.icns" "$APP/Contents/Resources/"
-cp "$APP_DIR/Simulator/logo.png" "$APP/Contents/Resources/"
+cp "$TARGET_DIR/Info.plist" "$APP/Contents/"
+cp "$TARGET_DIR/AppIcon.icns" "$APP/Contents/Resources/"
+cp "$TARGET_DIR/game-icon.png" "$APP/Contents/Resources/"
+cp "$TARGET_DIR/config.plist" "$APP/Contents/Resources/"
+cp "$TARGET_DIR/faq.txt" "$APP/Contents/Resources/"
 
 # LGPL 合规：将 LICENSE + THIRD_PARTY 文件打入 App bundle
 cp "$REPO_ROOT/LICENSE" "$APP/Contents/Resources/"
@@ -101,6 +152,9 @@ rsync -a "$REPO_ROOT/output/wine-release/" "$APP/Contents/Resources/wine-release
 # 覆盖 winecompat（确保是最新编译的）
 cp "$REPO_ROOT/output/wine-release/lib/wine/x86_64-unix/cxcompatdb.so" \
    "$APP/Contents/Resources/wine-release/lib/wine/x86_64-unix/cxcompatdb.so"
+# 覆盖 wineserverfix（确保是最新编译的；后续 .so 签名循环会用 Wine.entitlements 签它）
+cp "$REPO_ROOT/output/wine-release/lib/wine/x86_64-unix/wineserverfix.so" \
+   "$APP/Contents/Resources/wine-release/lib/wine/x86_64-unix/wineserverfix.so"
 
 # ---- Step 3: Developer ID 签名 ----
 echo "=== 4. Developer ID 签名 ==="
@@ -155,18 +209,27 @@ cp -a "$APP" "$STAGE/"
 # 不设 --icon 位置，让 Finder 自动排列，避免遮挡背景
 cp "$REPO_ROOT/LICENSE" "$STAGE/"
 
-# 使用 create-dmg 生成带拖拽箭头提示的安装 DMG
+# 使用 create-dmg 生成带拖拽箭头提示的安装 DMG。
+# 在隔离的临时目录构建后再移动到输出位置：create-dmg 会在输出目录创建临时
+# 可写镜像并由 Finder 写入窗口布局状态，隔离构建可保持输出目录整洁、布局可复现。
+DMG_BUILD_DIR="/private/tmp/sim-dmg-build"
+DMG_TMP="$DMG_BUILD_DIR/$PRODUCT_NAME.dmg"
+rm -rf "$DMG_BUILD_DIR"
+mkdir -p "$DMG_BUILD_DIR"
+
 create-dmg \
-  --volname "Yanyun" \
+  --volname "$PRODUCT_NAME" \
   --background "$SCRIPT_DIR/dmg-background.png" \
   --window-pos 200 120 \
   --window-size 660 400 \
   --icon-size 100 \
-  --icon "Yanyun.app" 160 185 \
+  --icon "$PRODUCT_NAME.app" 160 185 \
   --app-drop-link 500 185 \
   --no-internet-enable \
-  "$DMG" "$STAGE"
+  "$DMG_TMP" "$STAGE"
 
+mv "$DMG_TMP" "$DMG"
+rm -rf "$DMG_BUILD_DIR"
 rm -rf "$STAGE"
 
 # 签名 DMG

@@ -6,6 +6,7 @@
 | --- | --- | --- | --- |
 | Wine | 11.0 | LGPL-2.1 | <https://media.codeweavers.com/pub/crossover/source/crossover-sources-26.1.0.tar.gz> |
 | DXMT | 0.80 | LGPL-2.1 | <https://github.com/3Shain/dxmt> |
+| DXVK | 3.0.1 | zlib | <https://github.com/doitsujin/dxvk> |
 | MoltenVK | 1.4.1 | Apache-2.0 | <https://github.com/KhronosGroup/MoltenVK> |
 | GStreamer | 1.28.2 | LGPL-2.1 | <https://gstreamer.freedesktop.org> |
 | GLib | 2.88.1 | LGPL-2.1 | <https://gitlab.gnome.org/GNOME/glib> |

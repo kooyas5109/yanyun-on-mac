@@ -16,7 +16,7 @@ targets:
       - Simulator
     settings:
       base:
-        INFOPLIST_FILE: Simulator/Info.plist
+        INFOPLIST_FILE: targets/yanyun/Info.plist
         CODE_SIGN_ENTITLEMENTS: Simulator/Simulator.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: yanyun.simulator
         PRODUCT_NAME: "Simulator"
