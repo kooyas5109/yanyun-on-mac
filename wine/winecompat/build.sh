@@ -1,6 +1,6 @@
 #!/bin/bash
 # 编译 winecompat.c → output/wine-release/lib/wine/x86_64-unix/cxcompatdb.so
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -15,7 +15,7 @@ fi
 
 # 是否为 DEBUG 构建
 DEBUG_FLAG=""
-if [ "$1" = "--debug" ]; then
+if [ "${1:-}" = "--debug" ]; then
   DEBUG_FLAG="-DDEBUG"
   echo "=== 编译 winecompat (DEBUG) ==="
 else

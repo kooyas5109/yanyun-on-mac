@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/sysctl.h>
@@ -650,14 +651,15 @@ static void start_game_level_monitor(void) {
  *   引用了已 Release 的 resource（use-after-free / 析构竞态）。
  *   命中纯虚槽 → __cxa_pure_virtual → __builtin_trap() → ud2 → 硬崩。
  *
- * 修复（不改 dxmt 源码，运行时内存补丁）：
+ * v0.1.1 过渡修复（运行时内存补丁）：
  *   把 D3D11ResourceCommon 基类 vtable 的 GetType 槽改指向安全 stub，
  *   写入 D3D11_RESOURCE_DIMENSION_UNKNOWN(0) 后返回。BlitObject 遇 UNKNOWN
  *   走 switch default(break)，FormatDescription 保持空 → 后续拷贝被判 Invalid
  *   而跳过，避免硬崩。只改这一个槽，其它纯虚调用仍照常 trap（不掩盖真 bug）。
  *
- * 稳定性：RVA 由当前 dxmt d3d11.dll 反推硬编码；dxmt 升级可能漂移，
- *   打补丁前用 Itanium ABI typeinfo 名校验，不匹配则跳过（宁可不修不乱改）。
+ * 新运行时在 DXMT v0.80 源码中修复，见 runtime/patches/dxmt。这里的旧补丁
+ * 仅允许用于 SHA-256 精确匹配 v0.1.1 的 d3d11.dll，并继续校验 PE 边界和
+ * Itanium ABI typeinfo；任何身份或结构不匹配都跳过（宁可不修不乱改）。
  */
 
 /* GetType 签名：void GetType(this, D3D11_RESOURCE_DIMENSION* out)
@@ -673,6 +675,20 @@ static void __attribute__((ms_abi)) dxmt_gettype_safe_stub(void *thisptr, unsign
  * IUnknown(3 槽) + ID3D11DeviceChild(4 槽) 之后 = index7 = 偏移 0x38。*/
 #define DXMT_RESCOMMON_VPTR_RVA   0x31a480
 #define DXMT_GETTYPE_SLOT_OFF     0x38
+#define DXMT_LEGACY_D3D11_SHA256  "7ca382af0eb32d8a432f6efb14d594fefb45673663be1f7e6682254bff885c47"
+
+static size_t pe_image_size(void *dll_base) {
+    const unsigned char *base = (const unsigned char *)dll_base;
+    if (!base || base[0] != 'M' || base[1] != 'Z') return 0;
+    uint32_t pe_offset = *(const uint32_t *)(base + 0x3c);
+    if (pe_offset < 0x40 || pe_offset > 0x100000) return 0;
+    const unsigned char *nt = base + pe_offset;
+    if (nt[0] != 'P' || nt[1] != 'E' || nt[2] != 0 || nt[3] != 0) return 0;
+    const unsigned char *optional = nt + 4 + 20;
+    uint16_t magic = *(const uint16_t *)optional;
+    if (magic != 0x20b && magic != 0x10b) return 0;
+    return *(const uint32_t *)(optional + 56);
+}
 
 /* 从 PEB Loader 链表按文件名后缀查找已加载 PE 模块基址。
  * peb 由构造函数（wine 主线程，TEB 有效）读出后传入——本函数在我们自建的
@@ -718,17 +734,36 @@ static void *find_pe_module_base(void *peb_ptr, const char *dll_name_suffix) {
 /* 校验 vptr 确为 D3D11ResourceCommon 的 vtable（Itanium C++ ABI）：
  * vptr[-1] = typeinfo*；type_info+0x08 = 名字字符串指针（如
  * "N4dxmt19D3D11ResourceCommonE"）。名字含 "D3D11ResourceCommon" 即认为匹配。*/
-static int verify_rescommon_vtable(void **vptr) {
+static int verify_rescommon_vtable(void *dll_base, size_t image_size, void **vptr) {
+    uintptr_t image_start = (uintptr_t)dll_base;
+    uintptr_t image_end = image_start + image_size;
+    uintptr_t vptr_address = (uintptr_t)vptr;
+    if (vptr_address < image_start + sizeof(void *) ||
+        vptr_address + DXMT_GETTYPE_SLOT_OFF + sizeof(void *) > image_end)
+        return 0;
     void *typeinfo = vptr[-1];
-    if (!typeinfo) return 0;
+    if ((uintptr_t)typeinfo < image_start ||
+        (uintptr_t)typeinfo + 2 * sizeof(void *) > image_end)
+        return 0;
     const char *name = *(const char **)((char *)typeinfo + 8);
-    if (!name) return 0;
+    if ((uintptr_t)name < image_start || (uintptr_t)name >= image_end)
+        return 0;
+    if (!memchr(name, '\0', image_end - (uintptr_t)name))
+        return 0;
     return strstr(name, "D3D11ResourceCommon") != NULL;
 }
 
 static void patch_dxmt_pure_virtual(void *dll_base) {
+    size_t image_size = pe_image_size(dll_base);
+    if (!image_size ||
+        DXMT_RESCOMMON_VPTR_RVA + DXMT_GETTYPE_SLOT_OFF + sizeof(void *) > image_size) {
+#ifdef DEBUG
+        fprintf(stderr, "[compat] dxmt PE bounds verify failed, skip pure-virtual patch\n");
+#endif
+        return;
+    }
     void **vptr = (void **)((char *)dll_base + DXMT_RESCOMMON_VPTR_RVA);
-    if (!verify_rescommon_vtable(vptr)) {
+    if (!verify_rescommon_vtable(dll_base, image_size, vptr)) {
 #ifdef DEBUG
         fprintf(stderr, "[compat] dxmt vtable verify failed, skip pure-virtual patch\n");
 #endif
@@ -737,9 +772,9 @@ static void patch_dxmt_pure_virtual(void *dll_base) {
     void **slot = (void **)((char *)vptr + DXMT_GETTYPE_SLOT_OFF);
     long ps = getpagesize();
     void *pg = (void *)((unsigned long long)slot & ~(unsigned long long)(ps - 1));
-    if (mprotect(pg, ps * 2, PROT_READ | PROT_WRITE) != 0) return;
+    if (mprotect(pg, ps, PROT_READ | PROT_WRITE) != 0) return;
     *slot = (void *)dxmt_gettype_safe_stub;
-    mprotect(pg, ps * 2, PROT_READ);
+    mprotect(pg, ps, PROT_READ);
 #ifdef DEBUG
     fprintf(stderr, "[compat] dxmt GetType slot patched -> safe stub (base=%p)\n", dll_base);
 #endif
@@ -933,7 +968,14 @@ static void init_winecompat(void) {
      * 见上方「DXMT 纯虚崩溃热修复」注释。
      */
     if (backend == 2) {
-        start_dxmt_purevirt_patch();
+        const char *dxmt_hash = getenv("SIM_DXMT_D3D11_SHA256");
+        if (dxmt_hash && strcmp(dxmt_hash, DXMT_LEGACY_D3D11_SHA256) == 0) {
+            start_dxmt_purevirt_patch();
+        } else {
+#ifdef DEBUG
+            fprintf(stderr, "[compat] dxmt identity does not match v0.1.1; legacy patch disabled\n");
+#endif
+        }
     }
 
     /*

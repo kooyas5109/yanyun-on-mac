@@ -1,4 +1,6 @@
 import Cocoa
+import Darwin
+import UniformTypeIdentifiers
 
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)
@@ -151,6 +153,9 @@ let logsDir = appSupport.appendingPathComponent("Logs")
 let installerPath = appSupport.appendingPathComponent("fever-installer.exe")
 let feverGamesDir = winePrefix.appendingPathComponent("drive_c/Program Files/FeverGames")
 let launcherName = "FeverGamesLauncher.exe"
+let managedProcessRegistry = ManagedProcessRegistry(
+    fileURL: appSupport.appendingPathComponent(".managed-processes.json")
+)
 
 func ensureDirs() {
     try? fm.createDirectory(at: appSupport, withIntermediateDirectories: true)
@@ -214,6 +219,122 @@ let wineRoot: String? = {
 
 let wineBinary: String? = wineRoot.map { $0 + "/lib/wine/x86_64-unix/wine" }
 let wineserverBinary: String? = wineRoot.map { $0 + "/bin/wineserver" }
+let legacyDxmtD3D11SHA256: String? = wineRoot.flatMap {
+    RuntimeIntegrity.sha256(
+        ofFile: URL(fileURLWithPath: $0)
+            .appendingPathComponent("lib/dxmt/x86_64-windows/d3d11.dll")
+    )
+}
+
+func processSnapshot() -> [ProcessRecord] {
+    let process = Process()
+    let pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/bin/ps")
+    process.arguments = ["-axo", "pid=,ppid=,command="]
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    do {
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              let output = String(data: data, encoding: .utf8) else {
+            return []
+        }
+        return ProcessScope.parsePSOutput(output).map { record in
+            var pathBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+            let pathLength = pathBuffer.withUnsafeMutableBytes {
+                proc_pidpath(record.pid, $0.baseAddress, UInt32($0.count))
+            }
+            let executablePath = pathLength > 0 ? String(cString: pathBuffer) : nil
+            return ProcessRecord(
+                pid: record.pid,
+                parentPID: record.parentPID,
+                command: record.command,
+                executablePath: executablePath
+            )
+        }
+    } catch {
+        log("读取进程列表失败: \(error)")
+        return []
+    }
+}
+
+func scopedProcessIDs(matching processName: String? = nil) -> Set<Int32> {
+    let records = processSnapshot()
+    let byPID = Dictionary(uniqueKeysWithValues: records.map { ($0.pid, $0) })
+    let registeredRoots = managedProcessRegistry.activePIDs { pid in
+        guard kill(pid, 0) == 0 || errno == EPERM,
+              let record = byPID[pid],
+              let runtime = wineRoot, !runtime.isEmpty else {
+            return false
+        }
+        // A persisted PID is trusted only while it still points into this runtime
+        // or prefix. This prevents PID reuse from ever targeting an unrelated app.
+        return record.command.contains(runtime) ||
+            record.command.contains(winePrefix.path) ||
+            record.command.contains(appIdentifier) ||
+            ProcessScope.executableBelongsToRuntime(
+                record.executablePath,
+                runtimePath: runtime
+            )
+    }
+    if let processName {
+        return ProcessScope.matchingProcessIDs(
+            processName,
+            in: records,
+            prefixPath: winePrefix.path,
+            appIdentifier: appIdentifier,
+            runtimePath: wineRoot ?? "",
+            registeredRootPIDs: registeredRoots
+        )
+    }
+    return ProcessScope.scopedProcessIDs(
+        in: records,
+        prefixPath: winePrefix.path,
+        appIdentifier: appIdentifier,
+        runtimePath: wineRoot ?? "",
+        registeredRootPIDs: registeredRoots
+    )
+}
+
+func processUsesCurrentWinePrefix(_ pid: Int32) -> Bool {
+    let process = Process()
+    let pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+    process.arguments = [
+        "-a",
+        "-p", String(pid),
+        "-d", "cwd,txt",
+        "-Fn",
+    ]
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    do {
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              let output = String(data: data, encoding: .utf8) else {
+            return false
+        }
+        return ProcessScope.openFiles(output, usePrefix: winePrefix.path)
+    } catch {
+        return false
+    }
+}
+
+func prefixOwnedProcessIDs(
+    matching processName: String,
+    in records: [ProcessRecord]? = nil
+) -> Set<Int32> {
+    let needle = processName.lowercased()
+    let snapshot = records ?? processSnapshot()
+    return Set(snapshot.lazy.filter {
+        $0.command.lowercased().contains(needle) &&
+            processUsesCurrentWinePrefix($0.pid)
+    }.map(\.pid))
+}
 
 // ============================================================
 // 启动状态（用 didSet 驱动 UI 切换）
@@ -251,17 +372,9 @@ var state: State = .idle {
     }
 }
 
-// 检测游戏平台 GUI 是否正在运行（只检测 Web 渲染进程，不检测后台服务）
+// 检测当前 WINEPREFIX 下的游戏平台 GUI（不匹配其他 Wine/模拟器实例）。
 func isFeverRunning() -> Bool {
-    let pg = Process()
-    pg.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-    pg.arguments = ["-f", "FeverGamesWeb"]
-    let pipe = Pipe()
-    pg.standardOutput = pipe
-    pg.standardError = pipe
-    try? pg.run()
-    pg.waitUntilExit()
-    return pg.terminationStatus == 0
+    !prefixOwnedProcessIDs(matching: "FeverGamesWeb").isEmpty
 }
 
 // ============================================================
@@ -620,6 +733,28 @@ qqGroupBtn.contentTintColor = NSColor(name: nil) { appearance in
 }
 qqGroupBtn.title = " QQ交流群：\(qqGroupHandler.qqGroupNumber)"
 settingsPanel.addSubview(qqGroupBtn)
+
+class DiagnosticsHandler: NSObject {
+    @objc func handleExport() {
+        presentDiagnosticsExport()
+    }
+}
+let diagnosticsHandler = DiagnosticsHandler()
+let diagnosticsBtn = NSButton(frame: NSRect(x: 8, y: 260, width: 197, height: 28))
+diagnosticsBtn.isBordered = false
+diagnosticsBtn.alignment = .left
+diagnosticsBtn.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+diagnosticsBtn.target = diagnosticsHandler
+diagnosticsBtn.action = #selector(DiagnosticsHandler.handleExport)
+diagnosticsBtn.image = makeSymbolIcon("square.and.arrow.up")
+diagnosticsBtn.imagePosition = .imageLeft
+diagnosticsBtn.contentTintColor = NSColor(name: nil) { appearance in
+    appearance.bestMatch(from: [.darkAqua]) == .darkAqua
+        ? NSColor(white: 0.75, alpha: 1.0)
+        : NSColor(white: 0.2, alpha: 1.0)
+}
+diagnosticsBtn.title = " 导出诊断报告"
+settingsPanel.addSubview(diagnosticsBtn)
 cv.addSubview(settingsPanel)
 
 // ============================================================
@@ -715,7 +850,7 @@ func showErrorUI(_ msg: String) {
 // ============================================================
 func shell(_ exe: String, _ args: [String], env: [String: String]? = nil, timeout: TimeInterval? = nil) -> (Int32, String) {
     // 如果有自定义 env，写临时脚本执行（绕过 SIP 的 DYLD 剥离）
-    // 如果没有 env，直接用 Process 执行（系统命令如 ps/pkill）
+    // 如果没有 env，直接用 Process 执行系统命令。
     let p = Process()
     let pipe = Pipe()
     p.standardOutput = pipe
@@ -739,7 +874,6 @@ func shell(_ exe: String, _ args: [String], env: [String: String]? = nil, timeou
         try? scriptContent.write(to: scriptPath, atomically: true, encoding: .utf8)
         try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath.path)
         log("[shell] 脚本路径: \(scriptPath.path)")
-        log("[shell] 脚本内容(最后2行): \(scriptLines.suffix(2).joined(separator: " | "))")
         p.executableURL = scriptPath
         
         // 注意：不能用 defer 删脚本，必须等进程执行完再删
@@ -749,8 +883,8 @@ func shell(_ exe: String, _ args: [String], env: [String: String]? = nil, timeou
                 let sem = DispatchSemaphore(value: 0)
                 var result: (Int32, String) = (-1, "timeout")
                 DispatchQueue.global().async {
-                    p.waitUntilExit()
                     let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                    p.waitUntilExit()
                     result = (p.terminationStatus, out)
                     sem.signal()
                 }
@@ -762,8 +896,8 @@ func shell(_ exe: String, _ args: [String], env: [String: String]? = nil, timeou
                 try? fm.removeItem(at: scriptPath)
                 return result
             } else {
-                p.waitUntilExit()
                 let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                p.waitUntilExit()
                 try? fm.removeItem(at: scriptPath)
                 return (p.terminationStatus, out)
             }
@@ -782,8 +916,8 @@ func shell(_ exe: String, _ args: [String], env: [String: String]? = nil, timeou
             let sem = DispatchSemaphore(value: 0)
             var result: (Int32, String) = (-1, "timeout")
             DispatchQueue.global().async {
-                p.waitUntilExit()
                 let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                p.waitUntilExit()
                 result = (p.terminationStatus, out)
                 sem.signal()
             }
@@ -793,17 +927,24 @@ func shell(_ exe: String, _ args: [String], env: [String: String]? = nil, timeou
             }
             return result
         } else {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             p.waitUntilExit()
+            let out = String(data: data, encoding: .utf8) ?? ""
+            return (p.terminationStatus, out)
         }
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        return (p.terminationStatus, out)
     } catch {
         return (-1, error.localizedDescription)
     }
 }
 
 /// 启动后台 Wine 进程（不等待退出）
-func launchWineBackground(exe: String, args: [String], env: [String: String], workDir: String? = nil) -> Process? {
+func launchWineBackground(
+    exe: String,
+    args: [String],
+    env: [String: String],
+    workDir: String? = nil,
+    role: String = "wine"
+) -> Process? {
     let scriptPath = appSupport.appendingPathComponent("_launch_\(Int.random(in: 10000...99999)).sh")
     var scriptLines = ["#!/bin/bash"]
     for (k, v) in env {
@@ -842,13 +983,18 @@ func launchWineBackground(exe: String, args: [String], env: [String: String], wo
         p.standardError = FileHandle.nullDevice
     }
     // 设置 terminationHandler 回收子进程（避免僵尸进程）
-    p.terminationHandler = { _ in
+    p.terminationHandler = { process in
+        managedProcessRegistry.remove(pid: process.processIdentifier)
         DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
             try? fm.removeItem(at: scriptPath)
         }
     }
     do {
         try p.run()
+        managedProcessRegistry.record(pid: p.processIdentifier, role: role)
+        if !p.isRunning {
+            managedProcessRegistry.remove(pid: p.processIdentifier)
+        }
         return p
     } catch {
         try? fm.removeItem(at: scriptPath)
@@ -872,17 +1018,33 @@ func verifyWine() -> Bool {
     return true
 }
 
+func markerMatches(_ url: URL, expected: String) -> Bool {
+    guard let value = try? String(contentsOf: url, encoding: .utf8) else {
+        return false
+    }
+    return value == expected
+}
+
 func checkPrefix() -> Bool {
-    // 检查 prefix 初始化完成标记（initPrefix 成功后写入）
-    let readyMarker = winePrefix.appendingPathComponent(".prefix_ready").path
-    if fm.fileExists(atPath: readyMarker) {
+    let readyMarker = winePrefix.appendingPathComponent(".prefix_ready")
+    let systemReg = winePrefix.appendingPathComponent("system.reg")
+    let userReg = winePrefix.appendingPathComponent("user.reg")
+    if markerMatches(readyMarker, expected: "prefix-v2"),
+       fm.fileExists(atPath: systemReg.path),
+       fm.fileExists(atPath: userReg.path) {
         return true
     }
-    // 标记不存在，但 prefix 目录可能有残留（中断导致的不完整状态）
-    let systemReg = winePrefix.appendingPathComponent("system.reg").path
-    if fm.fileExists(atPath: systemReg) {
-        log("prefix 不完整（system.reg 存在但 .prefix_ready 缺失），清理后重新初始化")
-        try? fm.removeItem(at: winePrefix)
+
+    // 只移除失效的成功标记，绝不自动删除已有 prefix 或游戏文件。
+    if fm.fileExists(atPath: readyMarker.path) {
+        do {
+            try fm.removeItem(at: readyMarker)
+        } catch {
+            log("无法移除失效的 prefix 标记: \(error)")
+        }
+    }
+    if fm.fileExists(atPath: winePrefix.path) {
+        log("prefix 未完成或缺少成功标记，将在原目录内修复；不会删除现有游戏数据")
     }
     return false
 }
@@ -1059,8 +1221,12 @@ private func sfntRebuild(source: Data, newNameTable: Data) -> Data? {
     return Data(file)
 }
 
-func initPrefix() {
-    guard let w = wineBinary else { return }
+@discardableResult
+func initPrefix() -> Bool {
+    guard let w = wineBinary else {
+        log("prefix 初始化失败: Wine 不可用")
+        return false
+    }
     
     // 复制 macOS 中文字体到 Wine Fonts 目录（在 wineboot 之前放好）
     let fontsDir = winePrefix.appendingPathComponent("drive_c/windows/Fonts")
@@ -1118,35 +1284,55 @@ func initPrefix() {
     log("执行 wineboot -u ...")
     let (code, output) = shell(w, ["wineboot", "-u"], env: buildEnv(), timeout: 120)
     log("wineboot 完成: code=\(code), output=\(output.prefix(500))")
+    guard code == 0 else {
+        log("prefix 初始化失败: wineboot 返回 \(code)")
+        return false
+    }
     
     // wineboot 后等待 wineserver 完成初始化
-    if let ws = wineserverBinary {
-        log("等待 wineserver 完成 (wineserver -w)...")
-        shell(ws, ["-w"], env: buildEnv(), timeout: 60)
-        log("wineserver 已完成")
+    guard let ws = wineserverBinary else {
+        log("prefix 初始化失败: wineserver 不可用")
+        return false
     }
+    log("等待 wineserver 完成 (wineserver -w)...")
+    let (serverCode, serverOutput) = shell(ws, ["-w"], env: buildEnv(), timeout: 60)
+    guard serverCode == 0 else {
+        log("prefix 初始化失败: wineserver -w 返回 \(serverCode), \(serverOutput.prefix(300))")
+        return false
+    }
+    log("wineserver 已完成")
     
     // 安装原生运行时库（HLSL 编译器 + VC++ 运行时）到 system32
     // 游戏运行时依赖这些原生库：内置替代实现无法编译部分着色器、且与游戏的
     // C++ 对象二进制不兼容，缺失会导致着色器编译失败或纯虚函数调用崩溃。
-    installNativeRuntime()
+    guard installNativeRuntime() else {
+        log("prefix 初始化失败: 原生运行时安装不完整")
+        return false
+    }
     
     // 写字体注册表替换
     let userReg = winePrefix.appendingPathComponent("user.reg")
-    if var regContent = try? String(contentsOf: userReg, encoding: .utf8) {
-        if !regContent.contains("[Software\\\\Wine\\\\Fonts\\\\Replacements]") {
-            regContent += "\n[Software\\\\Wine\\\\Fonts\\\\Replacements]\n"
-            regContent += "\"Microsoft Sans Serif\"=\"STHeiti\"\n"
-            regContent += "\"MS Sans Serif\"=\"STHeiti\"\n"
-            regContent += "\"MS Shell Dlg\"=\"STHeiti\"\n"
-            regContent += "\"MS Shell Dlg 2\"=\"STHeiti\"\n"
-            regContent += "\"SimSun\"=\"STHeiti\"\n"
-            regContent += "\"NSimSun\"=\"STHeiti\"\n"
-            regContent += "\"宋体\"=\"STHeiti\"\n"
-            regContent += "\"微软雅黑\"=\"STHeiti\"\n"
-            regContent += "\"Tahoma\"=\"STHeiti\"\n"
-            try? regContent.write(to: userReg, atomically: true, encoding: .utf8)
+    guard var regContent = try? String(contentsOf: userReg, encoding: .utf8) else {
+        log("prefix 初始化失败: 无法读取 user.reg")
+        return false
+    }
+    if !regContent.contains("[Software\\\\Wine\\\\Fonts\\\\Replacements]") {
+        regContent += "\n[Software\\\\Wine\\\\Fonts\\\\Replacements]\n"
+        regContent += "\"Microsoft Sans Serif\"=\"STHeiti\"\n"
+        regContent += "\"MS Sans Serif\"=\"STHeiti\"\n"
+        regContent += "\"MS Shell Dlg\"=\"STHeiti\"\n"
+        regContent += "\"MS Shell Dlg 2\"=\"STHeiti\"\n"
+        regContent += "\"SimSun\"=\"STHeiti\"\n"
+        regContent += "\"NSimSun\"=\"STHeiti\"\n"
+        regContent += "\"宋体\"=\"STHeiti\"\n"
+        regContent += "\"微软雅黑\"=\"STHeiti\"\n"
+        regContent += "\"Tahoma\"=\"STHeiti\"\n"
+        do {
+            try regContent.write(to: userReg, atomically: true, encoding: .utf8)
             log("字体注册表替换已写入")
+        } catch {
+            log("prefix 初始化失败: 无法写入 user.reg: \(error)")
+            return false
         }
     }
 
@@ -1161,8 +1347,16 @@ func initPrefix() {
         ("宋体 (TrueType)", "simsun_fix.ttf"),
     ]
     for reg in fontRegs where fm.fileExists(atPath: fontsDir.appendingPathComponent(reg.file).path) {
-        let _ = shell(w, ["reg", "add", fontKey, "/v", reg.name, "/t", "REG_SZ",
-                          "/d", "C:\\windows\\Fonts\\\(reg.file)", "/f"], env: buildEnv())
+        let (regCode, regOutput) = shell(
+            w,
+            ["reg", "add", fontKey, "/v", reg.name, "/t", "REG_SZ",
+             "/d", "C:\\windows\\Fonts\\\(reg.file)", "/f"],
+            env: buildEnv()
+        )
+        guard regCode == 0 else {
+            log("prefix 初始化失败: 字体注册 \(reg.name) 返回 \(regCode), \(regOutput.prefix(300))")
+            return false
+        }
     }
     log("中文字体已注册到系统字体表")
 
@@ -1170,33 +1364,56 @@ func initPrefix() {
     
     // 写入初始化完成标记（checkPrefix 依赖此文件判断 prefix 完整性）
     let readyMarker = winePrefix.appendingPathComponent(".prefix_ready")
-    try? "1".write(to: readyMarker, atomically: true, encoding: .utf8)
-    log("prefix 初始化完成标记已写入")
+    do {
+        try "prefix-v2".write(to: readyMarker, atomically: true, encoding: .utf8)
+        log("prefix 初始化完成标记已写入")
+        return true
+    } catch {
+        log("prefix 初始化完成但标记写入失败: \(error)")
+        return false
+    }
 }
 
 // 将 wine-release/redist 下的原生运行时库拷贝进 prefix 的 system32。
 // Wine 默认加载顺序对这些库优先 native，放到 system32 即可被游戏加载，
 // 无需额外的 DllOverrides 注册表项。
-func installNativeRuntime() {
-    guard let r = wineRoot else { return }
+@discardableResult
+func installNativeRuntime() -> Bool {
+    guard let r = wineRoot else { return false }
     let redistDir = URL(fileURLWithPath: r).appendingPathComponent("redist")
     let system32 = winePrefix.appendingPathComponent("drive_c/windows/system32")
     guard let files = try? fm.contentsOfDirectory(at: redistDir, includingPropertiesForKeys: nil) else {
-        log("redist 目录不存在，跳过原生运行时安装: \(redistDir.path)")
-        return
+        log("redist 目录不存在，无法安装原生运行时: \(redistDir.path)")
+        return false
+    }
+    let dlls = files.filter { $0.pathExtension.lowercased() == "dll" }
+    guard !dlls.isEmpty else {
+        log("redist 目录没有 DLL: \(redistDir.path)")
+        return false
     }
     var count = 0
-    for src in files where src.pathExtension.lowercased() == "dll" {
+    var failed = false
+    for src in dlls {
         let dst = system32.appendingPathComponent(src.lastPathComponent)
-        try? fm.removeItem(at: dst)
+        let temporary = system32.appendingPathComponent(".\(src.lastPathComponent).tmp")
         do {
-            try fm.copyItem(at: src, to: dst)
+            if fm.fileExists(atPath: temporary.path) {
+                try fm.removeItem(at: temporary)
+            }
+            try fm.copyItem(at: src, to: temporary)
+            if fm.fileExists(atPath: dst.path) {
+                try fm.removeItem(at: dst)
+            }
+            try fm.moveItem(at: temporary, to: dst)
             count += 1
         } catch {
+            try? fm.removeItem(at: temporary)
+            failed = true
             log("原生运行时拷贝失败 \(src.lastPathComponent): \(error)")
         }
     }
     log("原生运行时安装完成，共 \(count) 个库 → system32")
+    return !failed && count == dlls.count
 }
 
 // ============================================================
@@ -1214,45 +1431,78 @@ func installNativeRuntime() {
 // 这里做两件事，且对存量 prefix 自愈：
 //   1. 若 system32 缺 mshtml.tlb，从 wine-release 拷进去；
 //   2. 注册表 4 个键指向 system32\mshtml.tlb。
-func ensureMshtmlTypeLib(_ w: String) {
-    let marker = winePrefix.appendingPathComponent(".mshtml_typelib_fixed_v2")
-    if fm.fileExists(atPath: marker.path) { return }
+@discardableResult
+func ensureMshtmlTypeLib(_ w: String) -> Bool {
+    let marker = winePrefix.appendingPathComponent(".mshtml_typelib_fixed_v3")
 
     let system32 = winePrefix.appendingPathComponent("drive_c/windows/system32")
     let tlb = system32.appendingPathComponent("mshtml.tlb")
     let dll = system32.appendingPathComponent("mshtml.dll")
-    // mshtml.dll 缺失说明 prefix 尚未初始化完整，跳过（下次初始化好再补）
-    guard fm.fileExists(atPath: dll.path) else { return }
+    if markerMatches(marker, expected: "mshtml-typelib-v3") &&
+       fm.fileExists(atPath: tlb.path) {
+        return true
+    }
+    guard fm.fileExists(atPath: dll.path) else {
+        log("mshtml TypeLib 修复失败: mshtml.dll 不存在")
+        return false
+    }
 
     // 若 system32 缺 mshtml.tlb，从 wine-release 拷贝（存量 prefix 自愈的关键）
     if !fm.fileExists(atPath: tlb.path), let r = wineRoot {
         let srcTlb = URL(fileURLWithPath: r)
             .appendingPathComponent("lib/wine/x86_64-windows/mshtml.tlb")
         if fm.fileExists(atPath: srcTlb.path) {
-            try? fm.copyItem(at: srcTlb, to: tlb)
-            log("mshtml.tlb 已补入 system32")
+            do {
+                try fm.copyItem(at: srcTlb, to: tlb)
+                log("mshtml.tlb 已补入 system32")
+            } catch {
+                log("mshtml TypeLib 修复失败: \(error)")
+                return false
+            }
         }
     }
 
-    // 类型库必须指向 mshtml.tlb（含公共 LIBID_MSHTML）；缺失才无奈回退 dll
-    let typelibPath = fm.fileExists(atPath: tlb.path)
-        ? "C:\\windows\\system32\\mshtml.tlb"
-        : "C:\\windows\\system32\\mshtml.dll"
+    guard fm.fileExists(atPath: tlb.path) else {
+        log("mshtml TypeLib 修复失败: mshtml.tlb 不存在")
+        return false
+    }
+    let typelibPath = "C:\\windows\\system32\\mshtml.tlb"
 
     let guidKey = "HKCR\\TypeLib\\{3050F1C5-98B5-11CF-BB82-00AA00BDCE0B}\\4.0"
-    shell(w, ["reg", "add", guidKey, "/ve", "/d", "Microsoft HTML Object Library", "/f"], env: buildEnv())
-    shell(w, ["reg", "add", "\(guidKey)\\0\\win64", "/ve", "/d", typelibPath, "/f"], env: buildEnv())
-    shell(w, ["reg", "add", "\(guidKey)\\FLAGS", "/ve", "/d", "0", "/f"], env: buildEnv())
-    shell(w, ["reg", "add", "\(guidKey)\\HELPDIR", "/ve", "/d", "C:\\windows\\system32", "/f"], env: buildEnv())
+    let commands = [
+        ["reg", "add", guidKey, "/ve", "/d", "Microsoft HTML Object Library", "/f"],
+        ["reg", "add", "\(guidKey)\\0\\win64", "/ve", "/d", typelibPath, "/f"],
+        ["reg", "add", "\(guidKey)\\FLAGS", "/ve", "/d", "0", "/f"],
+        ["reg", "add", "\(guidKey)\\HELPDIR", "/ve", "/d", "C:\\windows\\system32", "/f"],
+    ]
+    for command in commands {
+        let (code, output) = shell(w, command, env: buildEnv())
+        guard code == 0 else {
+            log("mshtml TypeLib 注册失败: code=\(code), output=\(output.prefix(300))")
+            return false
+        }
+    }
 
     // 强制 wineserver 把改动落盘：默认要等客户端全退出数秒后才 flush，
     // 若这期间进程被重启会丢失，显式 -w 等它写完再继续。
-    if let ws = wineserverBinary {
-        shell(ws, ["-w"], env: buildEnv())
+    guard let ws = wineserverBinary else {
+        log("mshtml TypeLib 修复失败: wineserver 不可用")
+        return false
+    }
+    let (serverCode, serverOutput) = shell(ws, ["-w"], env: buildEnv())
+    guard serverCode == 0 else {
+        log("mshtml TypeLib 落盘失败: code=\(serverCode), output=\(serverOutput.prefix(300))")
+        return false
     }
 
-    try? "1".write(to: marker, atomically: true, encoding: .utf8)
-    log("mshtml TypeLib 已注册（修复内嵌网页视图崩溃，指向 \(typelibPath)）")
+    do {
+        try "mshtml-typelib-v3".write(to: marker, atomically: true, encoding: .utf8)
+        log("mshtml TypeLib 已注册（修复内嵌网页视图崩溃，指向 \(typelibPath)）")
+        return true
+    } catch {
+        log("mshtml TypeLib 已注册但成功标记写入失败: \(error)")
+        return false
+    }
 }
 
 
@@ -1326,9 +1576,19 @@ func manageDriveLetters() {
 
 func checkFeverInstalled() -> Bool {
     let marker = appSupport.appendingPathComponent(".fever_installed")
-    let result = fm.fileExists(atPath: marker.path)
-    log("checkFeverInstalled: \(result)")
-    return result
+    let filesAreComplete = checkFeverFiles()
+    if filesAreComplete && !markerMatches(marker, expected: "fever-files-v2") {
+        do {
+            try "fever-files-v2".write(to: marker, atomically: true, encoding: .utf8)
+            log("检测到完整游戏平台文件，已补写安装成功标记")
+        } catch {
+            log("游戏平台文件完整，但安装标记写入失败: \(error)")
+        }
+    } else if !filesAreComplete && fm.fileExists(atPath: marker.path) {
+        log("安装标记存在但游戏平台文件不完整，将进入修复安装；不会删除 prefix")
+    }
+    log("checkFeverInstalled: marker=\(fm.fileExists(atPath: marker.path)), files=\(filesAreComplete)")
+    return filesAreComplete
 }
 
 // 文件级别检测：注册表有记录 AND launcher exe 存在（用于安装等待循环）
@@ -1390,6 +1650,11 @@ func buildEnv() -> [String: String] {
     if debugDxmt {
         env["SIM_BACKEND_OVERRIDE"] = "2"          // DXMT（调试对照用；正常发布 debugDxmt=false 不设此变量）
     }
+    if let hash = legacyDxmtD3D11SHA256 {
+        // winecompat 只对精确匹配 v0.1.1 的 DXMT 二进制启用过渡期内存补丁。
+        // 源码修复版的哈希不同，因此不会再被修改。
+        env["SIM_DXMT_D3D11_SHA256"] = hash
+    }
     // env["MTL_HUD_ENABLED"] = "1"  // 关闭 Metal FPS HUD
     // Wine 内部路径（显式设置，避免依赖相对路径 fallback）
     if let r = wineRoot {
@@ -1416,29 +1681,233 @@ func buildEnv() -> [String: String] {
     return env
 }
 
+private func writeRedactedDiagnosticFile(from source: URL, to destination: URL, limit: Int = 20_000_000) throws {
+    let data = try Data(contentsOf: source)
+    let bounded = data.count > limit ? data.suffix(limit) : data[...]
+    let text = String(decoding: bounded, as: UTF8.self)
+    let redacted = DiagnosticRedactor.redact(
+        text,
+        homeDirectory: fm.homeDirectoryForCurrentUser.path
+    )
+    try redacted.write(to: destination, atomically: true, encoding: .utf8)
+}
+
+private func diagnosticSystemValue(_ name: String) -> String {
+    let (code, output) = shell("/usr/sbin/sysctl", ["-n", name], timeout: 5)
+    return code == 0 ? output.trimmingCharacters(in: .whitespacesAndNewlines) : "unavailable"
+}
+
+private func createDiagnosticsArchive(at destination: URL) throws {
+    let diagnosticsRoot = appSupport.appendingPathComponent("Diagnostics")
+    try fm.createDirectory(at: diagnosticsRoot, withIntermediateDirectories: true)
+    let staging = diagnosticsRoot.appendingPathComponent("diagnostics-\(UUID().uuidString)")
+    try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: staging) }
+
+    for name in ["simulator.log", "wine_debug.log"] {
+        let source = logsDir.appendingPathComponent(name)
+        if fm.fileExists(atPath: source.path) {
+            try writeRedactedDiagnosticFile(from: source, to: staging.appendingPathComponent(name))
+        }
+    }
+
+    let records = processSnapshot()
+    let scopedPIDs = scopedProcessIDs()
+    let diagnosticPIDs = scopedPIDs.union(
+        prefixOwnedProcessIDs(matching: "FeverGames", in: records)
+    )
+    let processText = records
+        .filter { diagnosticPIDs.contains($0.pid) }
+        .map {
+            "pid=\($0.pid) ppid=\($0.parentPID) executable=\($0.executablePath ?? "unavailable") \($0.command)"
+        }
+        .joined(separator: "\n")
+    let redactedProcesses = DiagnosticRedactor.redact(
+        processText,
+        homeDirectory: fm.homeDirectoryForCurrentUser.path
+    )
+    try redactedProcesses.write(
+        to: staging.appendingPathComponent("processes.txt"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    var runtimeLines: [String] = []
+    if let root = wineRoot {
+        let criticalPaths = [
+            "bin/wineserver",
+            "lib/dxmt/x86_64-windows/d3d11.dll",
+            "lib/wine/x86_64-unix/wine",
+        ]
+        for path in criticalPaths {
+            let file = URL(fileURLWithPath: root).appendingPathComponent(path)
+            let hash = RuntimeIntegrity.sha256(ofFile: file) ?? "unavailable"
+            runtimeLines.append("\(hash)  \(path)")
+        }
+    }
+    try runtimeLines.joined(separator: "\n").write(
+        to: staging.appendingPathComponent("runtime-critical.sha256"),
+        atomically: true,
+        encoding: .utf8
+    )
+    if let manifest = Bundle.main.resourceURL?.appendingPathComponent("runtime-components.lock.json"),
+       fm.fileExists(atPath: manifest.path) {
+        try fm.copyItem(
+            at: manifest,
+            to: staging.appendingPathComponent("runtime-components.lock.json")
+        )
+    }
+
+    let info = Bundle.main.infoDictionary ?? [:]
+    let environment = """
+    product=\(cfg.productName)
+    appIdentifier=\(appIdentifier)
+    appVersion=\(info["CFBundleShortVersionString"] ?? "development")
+    buildVersion=\(info["CFBundleVersion"] ?? "development")
+    macOS=\(ProcessInfo.processInfo.operatingSystemVersionString)
+    model=\(diagnosticSystemValue("hw.model"))
+    chip=\(diagnosticSystemValue("machdep.cpu.brand_string"))
+    memoryBytes=\(diagnosticSystemValue("hw.memsize"))
+    prefixExists=\(fm.fileExists(atPath: winePrefix.path))
+    prefixReady=\(markerMatches(winePrefix.appendingPathComponent(".prefix_ready"), expected: "prefix-v2") &&
+        fm.fileExists(atPath: winePrefix.appendingPathComponent("system.reg").path) &&
+        fm.fileExists(atPath: winePrefix.appendingPathComponent("user.reg").path))
+    feverFilesComplete=\(checkFeverFiles())
+    dxmtLegacyHash=\(legacyDxmtD3D11SHA256 ?? "unavailable")
+    generatedAt=\(ISO8601DateFormatter().string(from: Date()))
+
+    Privacy: The archive contains launcher logs, scoped process commands, runtime
+    hashes and relevant recent crash reports. It does not collect registry files,
+    game files, account data or Wine-prefix contents. Home paths, common tokens
+    and URL query parameters are redacted on a best-effort basis.
+    """
+    let redactedEnvironment = DiagnosticRedactor.redact(
+        environment,
+        homeDirectory: fm.homeDirectoryForCurrentUser.path
+    )
+    try redactedEnvironment.write(
+        to: staging.appendingPathComponent("environment.txt"),
+        atomically: true,
+        encoding: .utf8
+    )
+
+    let crashSource = fm.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/DiagnosticReports")
+    let crashDestination = staging.appendingPathComponent("CrashReports")
+    let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]
+    if let reports = try? fm.contentsOfDirectory(
+        at: crashSource,
+        includingPropertiesForKeys: keys,
+        options: [.skipsHiddenFiles]
+    ) {
+        let cutoff = Date().addingTimeInterval(-14 * 24 * 60 * 60)
+        let relevant = reports.compactMap { url -> (URL, Date)? in
+            guard DiagnosticRedactor.isRelevantCrashReport(url.lastPathComponent),
+                  let values = try? url.resourceValues(forKeys: Set(keys)),
+                  values.isRegularFile == true,
+                  let date = values.contentModificationDate,
+                  date >= cutoff else {
+                return nil
+            }
+            return (url, date)
+        }
+        .sorted { $0.1 > $1.1 }
+        .prefix(20)
+
+        if !relevant.isEmpty {
+            try fm.createDirectory(at: crashDestination, withIntermediateDirectories: true)
+            for (source, _) in relevant {
+                try writeRedactedDiagnosticFile(
+                    from: source,
+                    to: crashDestination.appendingPathComponent(source.lastPathComponent),
+                    limit: 10_000_000
+                )
+            }
+        }
+    }
+
+    let temporaryArchive = destination.deletingLastPathComponent().appendingPathComponent(
+        ".\(destination.deletingPathExtension().lastPathComponent)-\(UUID().uuidString).partial.zip"
+    )
+    defer { try? fm.removeItem(at: temporaryArchive) }
+    let (code, output) = shell(
+        "/usr/bin/ditto",
+        ["-c", "-k", "--sequesterRsrc", "--keepParent", staging.path, temporaryArchive.path],
+        timeout: 120
+    )
+    guard code == 0 else {
+        throw NSError(
+            domain: "DiagnosticsExport",
+            code: Int(code),
+            userInfo: [NSLocalizedDescriptionKey: "压缩诊断报告失败：\(output.prefix(300))"]
+        )
+    }
+    if fm.fileExists(atPath: destination.path) {
+        _ = try fm.replaceItemAt(destination, withItemAt: temporaryArchive)
+    } else {
+        try fm.moveItem(at: temporaryArchive, to: destination)
+    }
+}
+
+func presentDiagnosticsExport() {
+    let panel = NSSavePanel()
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.dateFormat = "yyyyMMdd-HHmmss"
+    panel.nameFieldStringValue = "\(cfg.productName)-diagnostics-\(formatter.string(from: Date())).zip"
+    panel.allowedContentTypes = [.zip]
+    panel.canCreateDirectories = true
+    guard panel.runModal() == .OK, let destination = panel.url else { return }
+
+    showLoading("正在导出诊断报告...")
+    DispatchQueue.global(qos: .userInitiated).async {
+        do {
+            try createDiagnosticsArchive(at: destination)
+            log("诊断报告已导出: \(destination.path)")
+            DispatchQueue.main.async {
+                hideLoading()
+                let alert = NSAlert()
+                alert.messageText = "诊断报告已导出"
+                alert.informativeText = destination.path
+                alert.alertStyle = .informational
+                alert.addButton(withTitle: "好的")
+                alert.runModal()
+            }
+        } catch {
+            DispatchQueue.main.async {
+                hideLoading()
+                showError("诊断报告导出失败：\(error.localizedDescription)")
+            }
+        }
+    }
+}
+
 func forceQuitWine() {
-    // Step 1: 优雅退出（同步，确保 kill 信号发出）
+    // Step 1: wineserver -k 由 WINEPREFIX 定位，只影响当前模拟器环境。
     if let ws = wineserverBinary {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: ws)
-        p.arguments = ["-k"]
-        p.environment = buildEnv()
-        try? p.run()
-        p.waitUntilExit()
+        let (code, output) = shell(ws, ["-k"], env: buildEnv(), timeout: 15)
+        log("wineserver -k: code=\(code), output=\(output.prefix(200))")
     }
-    // Step 2: 精准清理（异步，不阻塞 App 退出。子进程会被 launchd 接管继续执行）
-    if let r = wineRoot {
-        let marker = r + "/lib/wine/x86_64-unix/ntdll.so"
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", "lsof 2>/dev/null | grep '\(marker)' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null"]
-        try? p.run()
+
+    // Step 2: 仅处理由本启动器登记、属于本 prefix 或实际使用本 prefix 的残留 PID。
+    let currentPID = ProcessInfo.processInfo.processIdentifier
+    let remaining = scopedProcessIDs()
+        .union(prefixOwnedProcessIDs(matching: "FeverGames"))
+        .filter { $0 != currentPID }
+    for pid in remaining {
+        if kill(pid, SIGTERM) == 0 {
+            log("已向当前 prefix 进程发送 SIGTERM: pid=\(pid)")
+        }
     }
-    // Step 3: 补充清理（异步）
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-    p.arguments = ["-9", "-f", appIdentifier]
-    try? p.run()
+    if !remaining.isEmpty {
+        Thread.sleep(forTimeInterval: 1)
+    }
+    for pid in remaining where kill(pid, 0) == 0 || errno == EPERM {
+        if kill(pid, SIGKILL) == 0 {
+            log("已清理当前 prefix 残留进程: pid=\(pid)")
+        }
+        managedProcessRegistry.remove(pid: pid)
+    }
 }
 
 // 拉起已运行的游戏平台窗口到前台（按 game 用 URL scheme 重新唤起对应游戏）
@@ -1448,7 +1917,13 @@ func bringFeverToFront(_ game: Game) {
     
     // 重新执行启动命令：launcher 检测到已有实例会把窗口拉到前台，并切换到对应游戏
     if let (launcher, workDir) = findFeverLauncher() {
-        let _ = launchWineBackground(exe: w, args: [launcher, game.launchURL], env: env, workDir: workDir)
+        let _ = launchWineBackground(
+            exe: w,
+            args: [launcher, game.launchURL],
+            env: env,
+            workDir: workDir,
+            role: "launcher"
+        )
         log("重新调用 launcher 拉起窗口: \(game.id) -> \(game.launchURL)")
     }
 }
@@ -1502,11 +1977,17 @@ func downloadInstaller() {
                   let dataObj = json["data"] as? [String: Any],
                   let downloadURLString = dataObj["download_url"] as? String,
                   let downloadURL = URL(string: downloadURLString) else {
-                log("JSON 接口解析失败: \(String(data: (try? Data(contentsOf: src)) ?? Data(), encoding: .utf8)?.prefix(200) ?? "")")
+                let raw = String(data: (try? Data(contentsOf: src)) ?? Data(), encoding: .utf8) ?? ""
+                let safe = DiagnosticRedactor.redact(raw, homeDirectory: fm.homeDirectoryForCurrentUser.path)
+                log("JSON 接口解析失败: \(safe.prefix(200))")
                 DispatchQueue.main.async { showError("解析下载地址失败") }
                 return
             }
-            log("检测到 JSON 接口模式，解析到安装器下载地址: \(downloadURLString)")
+            let safeURL = DiagnosticRedactor.redact(
+                downloadURLString,
+                homeDirectory: fm.homeDirectoryForCurrentUser.path
+            )
+            log("检测到 JSON 接口模式，解析到安装器下载地址: \(safeURL)")
             downloadInstallerFile(from: downloadURL)
             return
         }
@@ -1546,7 +2027,7 @@ func saveInstaller(from src: URL) {
     do {
         try fm.moveItem(at: src, to: installerPath)
         // 移除 extended attributes（防止 Gatekeeper 阻止 Wine 读取）
-        shell("/usr/bin/xattr", ["-cr", installerPath.path])
+        let _ = shell("/usr/bin/xattr", ["-cr", installerPath.path])
         DispatchQueue.main.async { installFever() }
     } catch {
         DispatchQueue.main.async { showError("保存安装器失败") }
@@ -1573,10 +2054,18 @@ func ensureInjectedWineserver() {
     // 带 DYLD_INSERT 预启动常驻 wineserver
     var env = buildEnv()
     env["DYLD_INSERT_LIBRARIES"] = shimPath
-    let _ = launchWineBackground(exe: ws, args: ["-p"], env: env)
+    guard let server = launchWineBackground(
+        exe: ws,
+        args: ["-p"],
+        env: env,
+        role: "wineserver"
+    ) else {
+        log("带注入的 wineserver 启动失败")
+        return
+    }
     // 等待常驻 server 就绪，避免后续 wine 客户端抢先自行 spawn 未注入的 server
     Thread.sleep(forTimeInterval: 2)
-    log("已预启动带 SNDBUF 注入的 wineserver（下载死锁修复）")
+    log("已预启动带 SNDBUF 注入的 wineserver（pid=\(server.processIdentifier)）")
 }
 
 func installFever() {
@@ -1600,7 +2089,12 @@ func installFeverCore() {
     let env = buildEnv()
     
     // 后台启动安装器（静默安装完成后会自动拉起平台）
-    guard let _ = launchWineBackground(exe: w, args: [winInstallerPath, "/VERYSILENT", "/SUPPRESSMSGBOXES"], env: env) else {
+    guard let _ = launchWineBackground(
+        exe: w,
+        args: [winInstallerPath, "/VERYSILENT", "/SUPPRESSMSGBOXES"],
+        env: env,
+        role: "installer"
+    ) else {
         showError("安装启动失败")
         return
     }
@@ -1616,18 +2110,9 @@ func installFeverCore() {
             Thread.sleep(forTimeInterval: 3)
             waited += 3
             
-            let pg = Process()
-            pg.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-            pg.arguments = ["-f", "FeverGamesWeb"]
-            let pipe = Pipe()
-            pg.standardOutput = pipe
-            pg.standardError = pipe
-            try? pg.run()
-            pg.waitUntilExit()
-            
-            if pg.terminationStatus == 0 {
+            if checkFeverFiles() {
                 success = true
-                log("检测到 FeverGamesWeb 进程（等待了 \(waited) 秒），安装完成")
+                log("检测到完整游戏平台文件（等待了 \(waited) 秒），安装完成")
                 break
             }
             if waited % 15 == 0 {
@@ -1642,8 +2127,13 @@ func installFeverCore() {
         
         // 安装成功，写入标记
         let marker = appSupport.appendingPathComponent(".fever_installed")
-        try? "1".write(to: marker, atomically: true, encoding: .utf8)
-        log("安装标记已写入")
+        do {
+            try "fever-files-v2".write(to: marker, atomically: true, encoding: .utf8)
+            log("安装标记已写入")
+        } catch {
+            DispatchQueue.main.async { showError("安装已完成，但无法写入成功标记：\(error.localizedDescription)") }
+            return
+        }
         
         // 清理安装器
         try? fm.removeItem(at: installerPath)
@@ -1674,7 +2164,13 @@ func launchGameCore(_ game: Game) {
     // launcher 据 gameId 直接进入对应游戏页面（燕云=37，遗忘之海=66）
     if let (launcher, workDir) = findFeverLauncher() {
         log("启动游戏 \(game.id): \(launcher) 参数: \(game.launchURL)")
-        if let _ = launchWineBackground(exe: w, args: [launcher, game.launchURL], env: env, workDir: workDir) {
+        if let _ = launchWineBackground(
+            exe: w,
+            args: [launcher, game.launchURL],
+            env: env,
+            workDir: workDir,
+            role: "launcher"
+        ) {
             log("Launcher + URL scheme 启动命令已执行")
         } else {
             log("启动失败，尝试 fallback（无参数）")
@@ -1702,17 +2198,7 @@ func launchGameCore(_ game: Game) {
             Thread.sleep(forTimeInterval: 3)
             waited += 3
             
-            // 检测 FeverGamesWeb 进程（出现表示平台 GUI 已加载）
-            let pg = Process()
-            pg.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-            pg.arguments = ["-f", "FeverGamesWeb"]
-            let pgPipe = Pipe()
-            pg.standardOutput = pgPipe
-            pg.standardError = pgPipe
-            try? pg.run()
-            pg.waitUntilExit()
-            
-            if pg.terminationStatus == 0 {
+            if isFeverRunning() {
                 foundWeb = true
                 log("检测到 FeverGamesWeb 进程（等待了 \(waited) 秒），GUI 已渲染")
                 // 额外等几秒让页面内容加载完
@@ -1734,16 +2220,7 @@ func launchGameCore(_ game: Game) {
             }
         } else {
             // 超时，检查是否有任何 FeverGames 相关进程在运行
-            let pg2 = Process()
-            pg2.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-            pg2.arguments = ["-f", "FeverGames"]
-            let pg2Pipe = Pipe()
-            pg2.standardOutput = pg2Pipe
-            pg2.standardError = pg2Pipe
-            try? pg2.run()
-            pg2.waitUntilExit()
-            
-            if pg2.terminationStatus == 0 {
+            if !prefixOwnedProcessIDs(matching: "FeverGames").isEmpty {
                 log("超时但检测到 FeverGames 进程，认为已启动")
                 DispatchQueue.main.async {
                     hideLoading()
@@ -1762,7 +2239,13 @@ func launchGameCore(_ game: Game) {
 @discardableResult
 func launchGameFallback(w: String, env: [String: String]) -> Bool {
     if let (launcher, workDir) = findFeverLauncher() {
-        if let _ = launchWineBackground(exe: w, args: [launcher], env: env, workDir: workDir) {
+        if let _ = launchWineBackground(
+            exe: w,
+            args: [launcher],
+            env: env,
+            workDir: workDir,
+            role: "launcher"
+        ) {
             log("Fallback: launcher 启动命令已执行")
             return true
         } else {
@@ -1789,7 +2272,7 @@ func startLaunch(_ game: Game) {
         // 先杀掉残留的 wineserver（确保新环境变量生效）
         // wineserver -k 只影响当前 WINEPREFIX，不会误杀其他 Wine 环境
         if let ws = wineserverBinary {
-            shell(ws, ["-k"], env: buildEnv())
+            let _ = shell(ws, ["-k"], env: buildEnv())
         }
         Thread.sleep(forTimeInterval: 1)
         
@@ -1798,7 +2281,10 @@ func startLaunch(_ game: Game) {
         if !checkPrefix() {
             showLoading("正在初始化 Wine 环境...")
             log("初始化 prefix: \(winePrefix.path)")
-            initPrefix()
+            guard initPrefix() else {
+                showError("Wine 环境初始化失败。现有游戏数据未被删除，请导出诊断报告后重试。")
+                return
+            }
             log("prefix 初始化完成")
         } else {
             log("prefix 已存在，跳过初始化")
@@ -1808,7 +2294,10 @@ func startLaunch(_ game: Game) {
         // 首次会跑 4 次 reg add + wineserver -w，耗时数秒；标记门控，之后秒过。
         if let w = wineBinary {
             showLoading("正在检查运行环境...")
-            ensureMshtmlTypeLib(w)
+            guard ensureMshtmlTypeLib(w) else {
+                showError("运行环境注册失败。现有游戏数据未被删除，请导出诊断报告后重试。")
+                return
+            }
         }
 
         // 盘符管理：映射外接设备到 Wine 盘符

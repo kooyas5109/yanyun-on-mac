@@ -1,6 +1,6 @@
 #!/bin/bash
 # 日常开发测试：编译 Universal Binary + 部署到桌面 App + 启动
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -35,6 +35,8 @@ done
 
 PRODUCT_NAME=$(/usr/libexec/PlistBuddy -c "Print :productName" "$TARGET_DIR/config.plist" 2>/dev/null || true)
 if [ -z "$PRODUCT_NAME" ]; then echo "❌ $TARGET_DIR/config.plist 缺少 productName"; exit 1; fi
+BUNDLE_IDENTIFIER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$TARGET_DIR/Info.plist" 2>/dev/null || true)
+if [ -z "$BUNDLE_IDENTIFIER" ]; then echo "❌ $TARGET_DIR/Info.plist 缺少 CFBundleIdentifier"; exit 1; fi
 echo "   部署目标: $TARGET  →  $PRODUCT_NAME"
 
 APP="$OUTPUT_DIR/$PRODUCT_NAME.app"
@@ -43,21 +45,23 @@ BUILD_DIR="$APP_DIR/build"
 mkdir -p "$BUILD_DIR"
 
 echo "=== 1. 杀掉正在运行的实例 ==="
-pkill -9 -f Simulator 2>/dev/null || true
+/usr/bin/osascript -e "tell application id \"$BUNDLE_IDENTIFIER\" to quit" 2>/dev/null || true
 sleep 1
+
+bash "$REPO_ROOT/scripts/runtime/verify-runtime.sh" "$REPO_ROOT/output/wine-release"
 
 echo "=== 2. 编译 Universal Binary ==="
 cd "$APP_DIR"
 swiftc -O -o "$BUILD_DIR/Simulator-arm64" \
   -target arm64-apple-macosx14.0 \
   -file-prefix-map "$REPO_ROOT=." \
-  Simulator/main.swift \
+  SimulatorCore/*.swift Simulator/main.swift \
   -framework Cocoa -framework AppKit
 
 swiftc -O -o "$BUILD_DIR/Simulator-x86_64" \
   -target x86_64-apple-macosx14.0 \
   -file-prefix-map "$REPO_ROOT=." \
-  Simulator/main.swift \
+  SimulatorCore/*.swift Simulator/main.swift \
   -framework Cocoa -framework AppKit
 
 lipo -create "$BUILD_DIR/Simulator-arm64" "$BUILD_DIR/Simulator-x86_64" \
@@ -83,6 +87,8 @@ cp "$TARGET_DIR/Info.plist" "$APP/Contents/Info.plist"
 cp "$TARGET_DIR/game-icon.png" "$APP/Contents/Resources/"
 cp "$TARGET_DIR/config.plist" "$APP/Contents/Resources/"
 cp "$TARGET_DIR/faq.txt" "$APP/Contents/Resources/"
+cp "$REPO_ROOT/runtime/components.lock.json" \
+   "$APP/Contents/Resources/runtime-components.lock.json"
 
 # LGPL 合规：更新 LICENSE + THIRD_PARTY
 cp "$REPO_ROOT/LICENSE" "$APP/Contents/Resources/"
@@ -95,6 +101,10 @@ cp "$REPO_ROOT/output/wine-release/lib/wine/x86_64-unix/wineserverfix.so" \
 codesign --force -s - "$APP/Contents/MacOS/Simulator"
 codesign --force -s - "$APP/Contents/Resources/wine-release/lib/wine/x86_64-unix/cxcompatdb.so"
 codesign --force -s - "$APP/Contents/Resources/wine-release/lib/wine/x86_64-unix/wineserverfix.so"
+codesign --force --options runtime \
+  --entitlements "$APP_DIR/Simulator/Simulator.entitlements" \
+  -s - "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
 
 echo "=== 5. 启动 ==="
 open "$APP"

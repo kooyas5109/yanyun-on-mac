@@ -14,6 +14,7 @@ targets:
     platform: macOS
     sources:
       - Simulator
+      - SimulatorCore
     settings:
       base:
         INFOPLIST_FILE: targets/yanyun/Info.plist
@@ -23,6 +24,10 @@ targets:
         DEBUG_INFORMATION_FORMAT: "dwarf"
         GENERATE_DEBUG_SYMBOLS: "NO"
     preBuildScripts:
+      - name: "Verify Wine Runtime"
+        script: |
+          bash "${SRCROOT}/../scripts/runtime/verify-runtime.sh" "${SRCROOT}/../output/wine-release"
+        basedOnDependencyAnalysis: false
       - name: "Build winecompat"
         script: |
           REPO_ROOT="${SRCROOT}/.."
@@ -36,14 +41,21 @@ targets:
             codesign --force -s - "$OUT"
           fi
         basedOnDependencyAnalysis: false
+      - name: "Build wineserverfix"
+        script: |
+          bash "${SRCROOT}/../wine/wineserverfix/build.sh"
+        basedOnDependencyAnalysis: false
       - name: "Copy Wine Runtime"
         script: |
           WINE_SRC="${SRCROOT}/../output/wine-release"
           WINE_DST="${BUILT_PRODUCTS_DIR}/${WRAPPER_NAME}/Contents/Resources/wine-release"
+          RESOURCES_DST="${BUILT_PRODUCTS_DIR}/${WRAPPER_NAME}/Contents/Resources"
           if [ -d "$WINE_SRC" ]; then
             mkdir -p "$WINE_DST"
             rsync -a --delete "$WINE_SRC/" "$WINE_DST/"
           fi
+          cp "${SRCROOT}/../runtime/components.lock.json" \
+             "$RESOURCES_DST/runtime-components.lock.json"
         basedOnDependencyAnalysis: false
     postBuildScripts:
       - name: "Sign Wine Binaries"

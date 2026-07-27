@@ -1,9 +1,9 @@
 #!/bin/bash
 # 正式打包：编译 + 构建 App Bundle + Developer ID 签名 + DMG
-set -e
+set -euo pipefail
 
 # 日志输出到文件（同时显示在终端）
-LOG_FILE="/tmp/build-release.log"
+LOG_FILE="$(mktemp "${TMPDIR:-/private/tmp}/yanyun-build-release.XXXXXX")"
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo ""
 echo "[$(date '+%H:%M:%S')] 构建开始，日志: $LOG_FILE"
@@ -59,7 +59,13 @@ APP="$OUTPUT_DIR/$PRODUCT_NAME.app"
 DMG="$OUTPUT_DIR/$PRODUCT_NAME.dmg"
 SIGN_ID="${SIGN_ID:-Developer ID Application}"  # 可通过环境变量覆盖，或直接填写你的签名身份
 ENTITLEMENTS="$APP_DIR/Simulator/Simulator.entitlements"
-STAGE="/tmp/dmg-stage"
+STAGE="$(mktemp -d "${TMPDIR:-/private/tmp}/yanyun-dmg-stage.XXXXXX")"
+DMG_BUILD_DIR=""
+cleanup() {
+    rm -rf "$STAGE"
+    if [ -n "$DMG_BUILD_DIR" ]; then rm -rf "$DMG_BUILD_DIR"; fi
+}
+trap cleanup EXIT
 
 mkdir -p "$BUILD_DIR"
 mkdir -p "$OUTPUT_DIR"
@@ -87,6 +93,10 @@ if [ ! -d "$REPO_ROOT/output/wine-release" ]; then
     echo "   请先准备 Wine 运行时（从 Releases 页面下载 wine-release.tar.gz 并解压到 output/）"
     exit 1
 fi
+if ! bash "$REPO_ROOT/scripts/runtime/verify-runtime.sh" "$REPO_ROOT/output/wine-release"; then
+    echo "❌ wine-release 与锁定的 v0.1.1 SHA-256 基线不一致"
+    exit 1
+fi
 echo "   wine-release: ✅"
 
 # 检查 create-dmg 是否安装
@@ -109,13 +119,13 @@ cd "$APP_DIR"
 swiftc -O -o "$BUILD_DIR/Simulator-arm64" \
   -target arm64-apple-macosx14.0 \
   -file-prefix-map "$REPO_ROOT=." \
-  Simulator/main.swift \
+  SimulatorCore/*.swift Simulator/main.swift \
   -framework Cocoa -framework AppKit
 
 swiftc -O -o "$BUILD_DIR/Simulator-x86_64" \
   -target x86_64-apple-macosx14.0 \
   -file-prefix-map "$REPO_ROOT=." \
-  Simulator/main.swift \
+  SimulatorCore/*.swift Simulator/main.swift \
   -framework Cocoa -framework AppKit
 
 lipo -create "$BUILD_DIR/Simulator-arm64" "$BUILD_DIR/Simulator-x86_64" \
@@ -141,6 +151,8 @@ cp "$TARGET_DIR/AppIcon.icns" "$APP/Contents/Resources/"
 cp "$TARGET_DIR/game-icon.png" "$APP/Contents/Resources/"
 cp "$TARGET_DIR/config.plist" "$APP/Contents/Resources/"
 cp "$TARGET_DIR/faq.txt" "$APP/Contents/Resources/"
+cp "$REPO_ROOT/runtime/components.lock.json" \
+   "$APP/Contents/Resources/runtime-components.lock.json"
 
 # LGPL 合规：将 LICENSE + THIRD_PARTY 文件打入 App bundle
 cp "$REPO_ROOT/LICENSE" "$APP/Contents/Resources/"
@@ -162,9 +174,6 @@ chmod -R u+w "$APP"
 # 只清除 quarantine 隔离标记（仅从互联网下载的文件才有此属性）
 # Info.plist 等已签名文件会报 Operation not permitted，属于正常现象，忽略即可
 find "$APP" -exec xattr -d com.apple.quarantine {} \; 2>/dev/null || true
-
-# 先解锁钥匙串（避免弹窗）
-security unlock-keychain ~/Library/Keychains/login.keychain-db 2>/dev/null || true
 
 WINE_ENTITLEMENTS="$APP_DIR/Simulator/Wine.entitlements"
 
@@ -194,14 +203,11 @@ codesign --force --options runtime --timestamp \
 
 # 验证
 echo "   验证签名..."
-codesign -dv "$APP" 2>&1 | grep -E "Authority|TeamIdentifier"
-echo "   验证 wineserver entitlements..."
-codesign -d --entitlements - "$APP/Contents/Resources/wine-release/bin/wineserver" 2>/dev/null | grep -o "allow-jit\|allow-dyld\|allow-unsigned" | head -5
+bash "$REPO_ROOT/scripts/verify-signature.sh" "$APP"
 
 # ---- Step 4: 制作 DMG（带拖拽安装提示）----
 echo "=== 5. 制作 DMG ==="
 rm -f "$DMG"
-rm -rf "$STAGE"
 mkdir -p "$STAGE"
 cp -a "$APP" "$STAGE/"
 
@@ -212,10 +218,8 @@ cp "$REPO_ROOT/LICENSE" "$STAGE/"
 # 使用 create-dmg 生成带拖拽箭头提示的安装 DMG。
 # 在隔离的临时目录构建后再移动到输出位置：create-dmg 会在输出目录创建临时
 # 可写镜像并由 Finder 写入窗口布局状态，隔离构建可保持输出目录整洁、布局可复现。
-DMG_BUILD_DIR="/private/tmp/sim-dmg-build"
+DMG_BUILD_DIR="$(mktemp -d "${TMPDIR:-/private/tmp}/yanyun-dmg-build.XXXXXX")"
 DMG_TMP="$DMG_BUILD_DIR/$PRODUCT_NAME.dmg"
-rm -rf "$DMG_BUILD_DIR"
-mkdir -p "$DMG_BUILD_DIR"
 
 create-dmg \
   --volname "$PRODUCT_NAME" \
@@ -230,10 +234,16 @@ create-dmg \
 
 mv "$DMG_TMP" "$DMG"
 rm -rf "$DMG_BUILD_DIR"
+DMG_BUILD_DIR=""
 rm -rf "$STAGE"
 
 # 签名 DMG
 codesign --force --timestamp --sign "$SIGN_ID" "$DMG"
+
+if [ "${NOTARIZE:-0}" = "1" ]; then
+    echo "=== 5.1 Apple 公证 ==="
+    bash "$REPO_ROOT/scripts/notarize-release.sh" "$DMG"
+fi
 
 # ---- Step 5: 验证 ----
 echo ""
@@ -251,8 +261,6 @@ echo "✅ 打包完成"
 echo "   App: $APP"
 echo "   DMG: $DMG ($(du -h "$DMG" | awk '{print $1}'))"
 echo "============================================"
-echo ""
-echo "下一步（可选）："
-echo "  # Apple 公证（需要 Apple ID 和 App 专用密码）"
-echo "  xcrun notarytool submit '$DMG' --apple-id <your-apple-id> --team-id <team-id> --password <app-specific-password> --wait"
-echo "  xcrun stapler staple '$DMG'"
+if [ "${NOTARIZE:-0}" != "1" ]; then
+    echo "提示：本次未公证。设置 NOTARIZE=1 并配置 NOTARY_PROFILE 或 App Store Connect API 密钥后可自动公证。"
+fi
