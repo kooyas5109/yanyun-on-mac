@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests
+        run: swift test
+
+      - name: Type-check launcher
+        run: |
+          swiftc -typecheck \
+            -target arm64-apple-macosx14.0 \
+            app/SimulatorCore/*.swift app/Simulator/main.swift \
+            -framework Cocoa -framework AppKit
+
+      - name: Compile native shims
+        run: |
+          clang -arch x86_64 -shared -O2 \
+            -mmacosx-version-min=10.15 \
+            -install_name win64/cxcompatdb.so \
+            -framework CoreFoundation -framework CoreGraphics \
+            wine/winecompat/winecompat.c \
+            -o "$RUNNER_TEMP/cxcompatdb.so"
+          clang -arch x86_64 -shared -O2 \
+            -mmacosx-version-min=10.15 \
+            -install_name win64/wineserverfix.so \
+            wine/wineserverfix/wineserverfix.c \
+            -o "$RUNNER_TEMP/wineserverfix.so"
+
+      - name: Validate pinned DXMT source patch
+        run: |
+          git init "$RUNNER_TEMP/dxmt"
+          git -C "$RUNNER_TEMP/dxmt" remote add origin https://github.com/3Shain/dxmt.git
+          git -C "$RUNNER_TEMP/dxmt" fetch --depth 1 origin 589adb780354b461645b29999cefaf533594ee99
+          git -C "$RUNNER_TEMP/dxmt" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/dxmt" rev-parse HEAD)" = "589adb780354b461645b29999cefaf533594ee99"
+          git -C "$RUNNER_TEMP/dxmt" apply --check \
+            "$GITHUB_WORKSPACE/runtime/patches/dxmt/0001-safe-resource-common-gettype.patch"
+
+      - name: Validate scripts and metadata
+        run: |
+          bash -n scripts/*.sh scripts/runtime/*.sh wine/*/build.sh
+          plutil -lint app/Simulator/*.entitlements app/targets/*/*.plist
+          jq empty runtime/components.lock.json
+          test -s runtime/baselines/v0.1.1.sha256
+          awk 'length($1) != 64 { exit 1 }' runtime/baselines/v0.1.1.sha256
+          test "$(LC_ALL=C sort runtime/baselines/v0.1.1.sha256 | uniq -d | wc -l | tr -d ' ')" = "0"
+          test "$(wc -l < runtime/baselines/v0.1.1.sha256 | tr -d ' ')" = \
+            "$(jq -r '.runtime.fileCount' runtime/components.lock.json)"
+          test "$(shasum -a 256 runtime/baselines/v0.1.1.sha256 | awk '{print $1}')" = \
+            "$(jq -r '.runtime.baselineSha256' runtime/components.lock.json)"

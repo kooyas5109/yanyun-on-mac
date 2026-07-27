@@ -1,0 +1,32 @@
+From 9ad7c2f78cfba0fc8bc51e7d34c7fc65742bf40f Mon Sep 17 00:00:00 2001
+From: yanyun-on-mac maintainers <noreply@example.invalid>
+Date: Mon, 27 Jul 2026 00:00:00 +0800
+Subject: [PATCH] d3d11: make resource base GetType safe during destruction
+
+The v0.80 binary can reach D3D11ResourceCommon's base vtable while a
+BlitObject asks an ID3D11Resource for its type. The inherited pure-virtual
+slot traps. Return UNKNOWN from the base implementation so the existing
+BlitObject validation path rejects the stale copy instead of crashing.
+
+Derived TResourceBase implementations retain their final dimension-specific
+override.
+---
+ src/d3d11/d3d11_resource.hpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/d3d11/d3d11_resource.hpp b/src/d3d11/d3d11_resource.hpp
+index 80927e5..9622c12 100644
+--- a/src/d3d11/d3d11_resource.hpp
++++ b/src/d3d11/d3d11_resource.hpp
+@@ -108,4 +108,9 @@
+ struct D3D11ResourceCommon : ID3D11Resource {
++
++    void STDMETHODCALLTYPE GetType(D3D11_RESOURCE_DIMENSION *pResourceDimension) override {
++      if (pResourceDimension)
++        *pResourceDimension = D3D11_RESOURCE_DIMENSION_UNKNOWN;
++    }
+     /* ID3D11Buffer::GetDesc */
+     /* ID3D11Texture1D::GetDesc */
+     /* ID3D11Texture2D::GetDesc */
+--
+2.50.1

@@ -1,0 +1,87 @@
+{
+  "formatVersion": 1,
+  "runtime": {
+    "baseline": "runtime/baselines/v0.1.1.sha256",
+    "baselineSha256": "78fd8f553220315a6311fd809f27816b2a5aca3b76f5bf4660edb9ff4bf8077a",
+    "fileCount": 4776,
+    "release": "v0.1.1",
+    "verification": "full-file-tree-sha256"
+  },
+  "components": [
+    {
+      "name": "Wine",
+      "version": "11.0",
+      "source": "https://media.codeweavers.com/pub/crossover/source/crossover-sources-26.1.0.tar.gz",
+      "sourceRevision": "crossover-26.1.0",
+      "sourceSha256": null,
+      "reproducibility": "blocked-pending-original-configure-flags-and-source-archive-sha256"
+    },
+    {
+      "name": "DXMT",
+      "version": "0.80",
+      "source": "https://github.com/3Shain/dxmt.git",
+      "sourceRevision": "589adb780354b461645b29999cefaf533594ee99",
+      "patches": [
+        "runtime/patches/dxmt/0001-safe-resource-common-gettype.patch"
+      ]
+    },
+    {
+      "name": "DXVK",
+      "version": "3.0.1",
+      "source": "https://github.com/doitsujin/dxvk.git",
+      "sourceRevision": "c850747f1df24180ce97b7a9094603f39da1251d"
+    },
+    {
+      "name": "MoltenVK",
+      "version": "1.4.1",
+      "source": "https://github.com/KhronosGroup/MoltenVK.git",
+      "sourceRevision": "db445ff2042d9ce348c439ad8451112f354b8d2a"
+    },
+    {
+      "name": "GStreamer",
+      "version": "1.28.2"
+    },
+    {
+      "name": "GLib",
+      "version": "2.88.1"
+    },
+    {
+      "name": "GnuTLS",
+      "version": "3.8.3"
+    },
+    {
+      "name": "SDL2",
+      "version": "2.30.9"
+    },
+    {
+      "name": "FreeType",
+      "version": "2.14.3"
+    },
+    {
+      "name": "libffi",
+      "version": "3.4.6"
+    },
+    {
+      "name": "Wine Gecko",
+      "version": "2.47.4"
+    },
+    {
+      "name": "Wine Mono",
+      "version": "10.4.1"
+    }
+  ],
+  "criticalFiles": [
+    {
+      "path": "bin/wineserver",
+      "sha256": "66e27448a04c8a7f7a66ecfd08a2ee3c237a75a01178c190fa9c74069bd102dd"
+    },
+    {
+      "path": "lib/dxmt/x86_64-windows/d3d11.dll",
+      "sha256": "7ca382af0eb32d8a432f6efb14d594fefb45673663be1f7e6682254bff885c47"
+    },
+    {
+      "path": "lib/wine/x86_64-unix/wine",
+      "sha256": "95b8d6733e301ed7664567f51a1b3dc169f46c985e2b7af6cb8ee1cfc9bedee9"
+    }
+  ]
+}
