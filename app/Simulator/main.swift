@@ -298,6 +298,44 @@ func scopedProcessIDs(matching processName: String? = nil) -> Set<Int32> {
     )
 }
 
+func processUsesCurrentWinePrefix(_ pid: Int32) -> Bool {
+    let process = Process()
+    let pipe = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+    process.arguments = [
+        "-a",
+        "-p", String(pid),
+        "-d", "cwd,txt",
+        "-Fn",
+    ]
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    do {
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0,
+              let output = String(data: data, encoding: .utf8) else {
+            return false
+        }
+        return ProcessScope.openFiles(output, usePrefix: winePrefix.path)
+    } catch {
+        return false
+    }
+}
+
+func prefixOwnedProcessIDs(
+    matching processName: String,
+    in records: [ProcessRecord]? = nil
+) -> Set<Int32> {
+    let needle = processName.lowercased()
+    let snapshot = records ?? processSnapshot()
+    return Set(snapshot.lazy.filter {
+        $0.command.lowercased().contains(needle) &&
+            processUsesCurrentWinePrefix($0.pid)
+    }.map(\.pid))
+}
+
 // ============================================================
 // 启动状态（用 didSet 驱动 UI 切换）
 // ============================================================
@@ -336,7 +374,7 @@ var state: State = .idle {
 
 // 检测当前 WINEPREFIX 下的游戏平台 GUI（不匹配其他 Wine/模拟器实例）。
 func isFeverRunning() -> Bool {
-    !scopedProcessIDs(matching: "FeverGamesWeb").isEmpty
+    !prefixOwnedProcessIDs(matching: "FeverGamesWeb").isEmpty
 }
 
 // ============================================================
@@ -1675,8 +1713,11 @@ private func createDiagnosticsArchive(at destination: URL) throws {
 
     let records = processSnapshot()
     let scopedPIDs = scopedProcessIDs()
+    let diagnosticPIDs = scopedPIDs.union(
+        prefixOwnedProcessIDs(matching: "FeverGames", in: records)
+    )
     let processText = records
-        .filter { scopedPIDs.contains($0.pid) }
+        .filter { diagnosticPIDs.contains($0.pid) }
         .map {
             "pid=\($0.pid) ppid=\($0.parentPID) executable=\($0.executablePath ?? "unavailable") \($0.command)"
         }
@@ -1848,9 +1889,11 @@ func forceQuitWine() {
         log("wineserver -k: code=\(code), output=\(output.prefix(200))")
     }
 
-    // Step 2: 仅处理由本启动器登记、属于本 prefix 或其后代的残留 PID。
+    // Step 2: 仅处理由本启动器登记、属于本 prefix 或实际使用本 prefix 的残留 PID。
     let currentPID = ProcessInfo.processInfo.processIdentifier
-    let remaining = scopedProcessIDs().filter { $0 != currentPID }
+    let remaining = scopedProcessIDs()
+        .union(prefixOwnedProcessIDs(matching: "FeverGames"))
+        .filter { $0 != currentPID }
     for pid in remaining {
         if kill(pid, SIGTERM) == 0 {
             log("已向当前 prefix 进程发送 SIGTERM: pid=\(pid)")
@@ -2177,7 +2220,7 @@ func launchGameCore(_ game: Game) {
             }
         } else {
             // 超时，检查是否有任何 FeverGames 相关进程在运行
-            if !scopedProcessIDs(matching: "FeverGames").isEmpty {
+            if !prefixOwnedProcessIDs(matching: "FeverGames").isEmpty {
                 log("超时但检测到 FeverGames 进程，认为已启动")
                 DispatchQueue.main.async {
                     hideLoading()

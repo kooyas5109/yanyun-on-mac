@@ -45,6 +45,16 @@ public enum ProcessScope {
         return executablePath == runtimePath || executablePath.hasPrefix(root)
     }
 
+    public static func openFiles(_ lsofOutput: String, usePrefix prefixPath: String) -> Bool {
+        guard !prefixPath.isEmpty else { return false }
+        let root = prefixPath.hasSuffix("/") ? prefixPath : prefixPath + "/"
+        return lsofOutput.split(whereSeparator: \.isNewline).contains { rawLine in
+            guard rawLine.first == "n" else { return false }
+            let path = rawLine.dropFirst()
+            return path == prefixPath || path.hasPrefix(root)
+        }
+    }
+
     public static func scopedProcessIDs(
         in records: [ProcessRecord],
         prefixPath: String,

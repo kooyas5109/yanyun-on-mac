@@ -82,4 +82,29 @@ final class ProcessScopeTests: XCTestCase {
 
         XCTAssertEqual(matches, [401])
     }
+
+    func testOpenFilePathsValidateExactWinePrefix() {
+        let currentPrefix = "/Users/me/Library/Application Support/ywzh.simulator/wine-prefix"
+        let currentOutput = """
+        p19351
+        fcwd
+        n\(currentPrefix)/drive_c/Program Files/FeverGames
+        ftxt
+        n\(currentPrefix)/drive_c/Program Files/FeverGames/1.18.41.2/icudtl.dat
+        """
+        let otherOutput = """
+        p29351
+        fcwd
+        n/Users/me/Library/Application Support/yanyun.simulator/wine-prefix/drive_c
+        """
+        let similarOutput = """
+        p39351
+        fcwd
+        n\(currentPrefix)-copy/drive_c
+        """
+
+        XCTAssertTrue(ProcessScope.openFiles(currentOutput, usePrefix: currentPrefix))
+        XCTAssertFalse(ProcessScope.openFiles(otherOutput, usePrefix: currentPrefix))
+        XCTAssertFalse(ProcessScope.openFiles(similarOutput, usePrefix: currentPrefix))
+    }
 }
