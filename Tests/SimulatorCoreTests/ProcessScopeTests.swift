@@ -48,4 +48,38 @@ final class ProcessScopeTests: XCTestCase {
 
         XCTAssertEqual(matches, [301])
     }
+
+    func testRuntimePathScopesReparentedWineProcessAfterLauncherExits() {
+        let records = [
+            ProcessRecord(
+                pid: 401,
+                parentPID: 1,
+                command: "FeverGamesWeb.exe --type=renderer",
+                executablePath: "/candidate/wine-release/lib/wine/x86_64-unix/wine"
+            ),
+            ProcessRecord(
+                pid: 501,
+                parentPID: 1,
+                command: "FeverGamesWeb.exe --type=renderer",
+                executablePath: "/other/wine-release/lib/wine/x86_64-unix/wine"
+            ),
+            ProcessRecord(
+                pid: 601,
+                parentPID: 1,
+                command: "FeverGamesWeb.exe --type=renderer",
+                executablePath: "/candidate/wine-release-copy/lib/wine/x86_64-unix/wine"
+            ),
+        ]
+
+        let matches = ProcessScope.matchingProcessIDs(
+            "FeverGamesWeb",
+            in: records,
+            prefixPath: "/missing/prefix",
+            appIdentifier: "missing.identifier",
+            runtimePath: "/candidate/wine-release",
+            registeredRootPIDs: []
+        )
+
+        XCTAssertEqual(matches, [401])
+    }
 }

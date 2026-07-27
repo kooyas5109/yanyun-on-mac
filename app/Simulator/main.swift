@@ -1,4 +1,5 @@
 import Cocoa
+import Darwin
 import UniformTypeIdentifiers
 
 let app = NSApplication.shared
@@ -240,7 +241,19 @@ func processSnapshot() -> [ProcessRecord] {
               let output = String(data: data, encoding: .utf8) else {
             return []
         }
-        return ProcessScope.parsePSOutput(output)
+        return ProcessScope.parsePSOutput(output).map { record in
+            var pathBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN) * 4)
+            let pathLength = pathBuffer.withUnsafeMutableBytes {
+                proc_pidpath(record.pid, $0.baseAddress, UInt32($0.count))
+            }
+            let executablePath = pathLength > 0 ? String(cString: pathBuffer) : nil
+            return ProcessRecord(
+                pid: record.pid,
+                parentPID: record.parentPID,
+                command: record.command,
+                executablePath: executablePath
+            )
+        }
     } catch {
         log("读取进程列表失败: \(error)")
         return []
@@ -260,7 +273,11 @@ func scopedProcessIDs(matching processName: String? = nil) -> Set<Int32> {
         // or prefix. This prevents PID reuse from ever targeting an unrelated app.
         return record.command.contains(runtime) ||
             record.command.contains(winePrefix.path) ||
-            record.command.contains(appIdentifier)
+            record.command.contains(appIdentifier) ||
+            ProcessScope.executableBelongsToRuntime(
+                record.executablePath,
+                runtimePath: runtime
+            )
     }
     if let processName {
         return ProcessScope.matchingProcessIDs(
@@ -268,6 +285,7 @@ func scopedProcessIDs(matching processName: String? = nil) -> Set<Int32> {
             in: records,
             prefixPath: winePrefix.path,
             appIdentifier: appIdentifier,
+            runtimePath: wineRoot ?? "",
             registeredRootPIDs: registeredRoots
         )
     }
@@ -275,6 +293,7 @@ func scopedProcessIDs(matching processName: String? = nil) -> Set<Int32> {
         in: records,
         prefixPath: winePrefix.path,
         appIdentifier: appIdentifier,
+        runtimePath: wineRoot ?? "",
         registeredRootPIDs: registeredRoots
     )
 }
@@ -1658,7 +1677,9 @@ private func createDiagnosticsArchive(at destination: URL) throws {
     let scopedPIDs = scopedProcessIDs()
     let processText = records
         .filter { scopedPIDs.contains($0.pid) }
-        .map { "pid=\($0.pid) ppid=\($0.parentPID) \($0.command)" }
+        .map {
+            "pid=\($0.pid) ppid=\($0.parentPID) executable=\($0.executablePath ?? "unavailable") \($0.command)"
+        }
         .joined(separator: "\n")
     let redactedProcesses = DiagnosticRedactor.redact(
         processText,
